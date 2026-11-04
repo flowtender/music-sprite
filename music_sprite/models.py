@@ -21,6 +21,8 @@ class TrackMetadata:
     album_artist: str | None = None
     year: int | None = None
     genre: str | None = None
+    bpm: int | None = None
+    key: str | None = None
     confidence: float = 0.0
     origin: str = "heuristic"
     musicbrainz: MusicBrainzIds | None = None

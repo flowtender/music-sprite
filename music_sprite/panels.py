@@ -446,6 +446,8 @@ def build_review_view(bot: "MusicBot", entry: QueueEntry, note: str | None = Non
         _field("Album", meta.album or f"{meta.title} (single)"),
         _field("Year", meta.year),
         _field("Genre", meta.genre),
+        _field("BPM", meta.bpm),
+        _field("Key", meta.key),
         f"-# source: {meta.origin} · confidence {meta.confidence:.0%}"
         + (" · MusicBrainz match" if meta.musicbrainz else "")
         + f" · queue id `{entry.id}`",

@@ -5,3 +5,4 @@ venv/
 music-sprite.env
 .claude/settings.local.json
 build/
+.analysis-model/

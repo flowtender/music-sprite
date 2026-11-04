@@ -1,12 +1,16 @@
+import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import heuristics
 from .acoustid import AcoustIdClient
+from .analysis import AnalysisError, Analyzer
 from .config import Config
 from .llm import LlmClient
 from .models import LookupUnavailable, TrackMetadata
 from .musicbrainz import MusicBrainzClient
+
+log = logging.getLogger(__name__)
 
 TRUSTED_SOURCE_CONFIDENCE = 0.9
 
@@ -37,13 +41,48 @@ def _distinct(matches: list[TrackMetadata]) -> list[TrackMetadata]:
 
 
 class MetadataResolver:
-    def __init__(self, config: Config, acoustid: AcoustIdClient, musicbrainz: MusicBrainzClient, llm: LlmClient):
+    def __init__(
+        self,
+        config: Config,
+        acoustid: AcoustIdClient,
+        musicbrainz: MusicBrainzClient,
+        llm: LlmClient,
+        analyzer: Analyzer,
+    ):
         self._config = config
         self._acoustid = acoustid
         self._musicbrainz = musicbrainz
         self._llm = llm
+        self._analyzer = analyzer
 
     async def resolve(self, info: dict, audio_path: Path) -> Resolution:
+        resolution = await self._resolve(info, audio_path)
+        await self._analyze(resolution, audio_path)
+        return resolution
+
+    async def _analyze(self, resolution: Resolution, audio_path: Path) -> None:
+        reason = self._analyzer.disabled_reason
+        if reason:
+            resolution.steps.append(f"Analysis: skipped ({reason})")
+            return
+        try:
+            analysis = await self._analyzer.analyze(audio_path)
+        except AnalysisError as error:
+            resolution.steps.append(f"Analysis: failed ({error})")
+            return
+        except Exception:
+            log.exception("audio analysis crashed for %s", audio_path)
+            resolution.steps.append("Analysis: crashed; see the service log")
+            return
+        resolution.steps.append(f"Analysis: {analysis.describe()}")
+
+        def with_analysis(meta: TrackMetadata) -> TrackMetadata:
+            return replace(meta, bpm=analysis.bpm, key=analysis.key, genre=meta.genre or analysis.genre)
+
+        resolution.metadata = with_analysis(resolution.metadata)
+        resolution.candidates = [with_analysis(candidate) for candidate in resolution.candidates]
+
+    async def _resolve(self, info: dict, audio_path: Path) -> Resolution:
         duration = info.get("duration")
         unavailable: list[str] = []
         draft = heuristics.guess(info, self._config.known_publishers)

@@ -46,6 +46,10 @@ class Config:
     musicbrainz_contact: str
     acoustid_api_key: str
 
+    analysis_enabled: bool
+    analysis_device: str
+    analysis_model_dir: Path
+
     llm_model: str
     llm_base_url: str
     llm_api_key: str
@@ -73,6 +77,9 @@ class Config:
         auto_import = os.environ.get("AUTO_IMPORT_CONFIDENCE", "")
         call_log = os.environ.get("LLM_CALL_LOG", str(state_dir / "llm_calls.jsonl"))
         template = os.environ.get("LIBRARY_PATH_TEMPLATE", DEFAULT_TEMPLATE)
+        analysis_device = os.environ.get("ANALYSIS_DEVICE", "").strip().lower() or "auto"
+        if analysis_device not in ("auto", "cpu"):
+            raise ValueError(f"ANALYSIS_DEVICE must be auto or cpu, got {analysis_device!r}")
         validate_template(template)
         return cls(
             discord_token=os.environ["DISCORD_TOKEN"],
@@ -90,6 +97,9 @@ class Config:
             known_publishers=_name_set("KNOWN_PUBLISHERS", "Epic Network,Xkito Music"),
             musicbrainz_contact=os.environ.get("MUSICBRAINZ_CONTACT", ""),
             acoustid_api_key=os.environ.get("ACOUSTID_API_KEY", ""),
+            analysis_enabled=_flag("ANALYSIS_ENABLED", True),
+            analysis_device=analysis_device,
+            analysis_model_dir=Path(os.environ.get("ANALYSIS_MODEL_DIR", state_dir / "models")),
             llm_model=os.environ.get("LLM_MODEL", ""),
             llm_base_url=os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1").rstrip("/"),
             llm_api_key=os.environ.get("LLM_API_KEY", ""),

@@ -7,6 +7,7 @@ I wanted a tool like this but haven't had time to make it myself, so I thought i
 It's (in theory, supposed to be) a discord bot that I can use to add music to my collection by:
 - downloading via yt-dlp
 - tagging based on metadata, heuristics, musicbrainz, LLM, and finally by hand
+- analyzing the audio itself (Essentia) for tempo, key and a genre guess, which go on the review card with the other tags
 - putting it in my navidrome server, where it will sync with my music players (this part is already set up from before)
 
 # License

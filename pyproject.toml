@@ -10,6 +10,10 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+[project.optional-dependencies]
+# Tempo, key and genre analysis of the audio (about 300 MB with TensorFlow)
+analysis = ["essentia-tensorflow"]
+
 [project.scripts]
 music-sprite = "music_sprite.__main__:main"
 

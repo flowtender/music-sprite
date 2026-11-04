@@ -11,6 +11,7 @@ from discord import app_commands
 
 from . import library
 from .acoustid import AcoustIdClient
+from .analysis import Analyzer
 from .config import Config
 from .downloader import DownloadError, DownloadedTrack, download, sanitize_extra_args
 from .llm import LlmClient
@@ -77,6 +78,7 @@ class MusicBot(discord.Client):
             AcoustIdClient(self.http_client, self.config),
             MusicBrainzClient(self.http_client, self.config.musicbrainz_contact),
             LlmClient(self.http_client, self.config),
+            Analyzer(self.config),
         )
         if self.config.guild_id:
             self._register_commands(discord.Object(id=self.config.guild_id), contexts=None)

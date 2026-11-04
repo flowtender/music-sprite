@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 from mutagen.flac import FLAC, Picture
-from mutagen.id3 import APIC, COMM, ID3, TALB, TCON, TDRC, TIT2, TPE1, TPE2, TXXX, UFID, WOAS, ID3NoHeaderError
+from mutagen.id3 import APIC, COMM, ID3, TALB, TBPM, TCON, TDRC, TIT2, TKEY, TPE1, TPE2, TXXX, UFID, WOAS, ID3NoHeaderError
 from mutagen.mp4 import MP4, AtomDataType, MP4Cover, MP4FreeForm
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
@@ -71,6 +71,10 @@ def _vorbis_fields(meta: TrackMetadata, source: dict[str, str]) -> dict[str, lis
         fields["date"] = [str(meta.year)]
     if meta.genre:
         fields["genre"] = [meta.genre]
+    if meta.bpm:
+        fields["bpm"] = [str(meta.bpm)]
+    if meta.key:
+        fields["initialkey"] = [meta.key]
     if meta.musicbrainz:
         fields["musicbrainz_trackid"] = [meta.musicbrainz.recording_id]
         if meta.musicbrainz.release_id:
@@ -125,6 +129,10 @@ def _write_mp3(path: Path, meta: TrackMetadata, source: dict[str, str], cover: b
         tags.add(TDRC(encoding=3, text=str(meta.year)))
     if meta.genre:
         tags.add(TCON(encoding=3, text=meta.genre))
+    if meta.bpm:
+        tags.add(TBPM(encoding=3, text=str(meta.bpm)))
+    if meta.key:
+        tags.add(TKEY(encoding=3, text=meta.key))
     if meta.musicbrainz:
         tags.add(UFID(owner="http://musicbrainz.org", data=meta.musicbrainz.recording_id.encode()))
         if meta.musicbrainz.release_id:
@@ -158,6 +166,10 @@ def _write_mp4(path: Path, meta: TrackMetadata, source: dict[str, str], cover: b
         audio["\xa9day"] = [str(meta.year)]
     if meta.genre:
         audio["\xa9gen"] = [meta.genre]
+    if meta.bpm:
+        audio["tmpo"] = [meta.bpm]
+    if meta.key:
+        audio["----:com.apple.iTunes:initialkey"] = [_freeform(meta.key)]
     if meta.musicbrainz:
         audio["----:com.apple.iTunes:MusicBrainz Track Id"] = [_freeform(meta.musicbrainz.recording_id)]
         if meta.musicbrainz.release_id:
