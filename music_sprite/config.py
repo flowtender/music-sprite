@@ -42,6 +42,7 @@ class Config:
 
     known_publishers: frozenset[str]
     musicbrainz_contact: str
+    acoustid_api_key: str
 
     llm_model: str
     llm_base_url: str
@@ -80,6 +81,7 @@ class Config:
             auto_import_confidence=float(auto_import) if auto_import else None,
             known_publishers=_name_set("KNOWN_PUBLISHERS", "Epic Network,Xkito Music"),
             musicbrainz_contact=os.environ.get("MUSICBRAINZ_CONTACT", ""),
+            acoustid_api_key=os.environ.get("ACOUSTID_API_KEY", ""),
             llm_model=os.environ.get("LLM_MODEL", ""),
             llm_base_url=os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1").rstrip("/"),
             llm_api_key=os.environ.get("LLM_API_KEY", ""),

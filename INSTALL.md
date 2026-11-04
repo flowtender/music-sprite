@@ -11,6 +11,8 @@ sudo python3 -m venv venv
 sudo venv/bin/pip install .
 ```
 
+Optional but recommended, for audio fingerprint matching: install `fpcalc` (Arch: `chromaprint`, Debian/Ubuntu: `libchromaprint-tools`) and set `ACOUSTID_API_KEY` in step 4.
+
 # 3. Service user
 with write access to your music folder
 ```bash

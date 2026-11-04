@@ -12,6 +12,7 @@ import httpx
 from discord import app_commands
 
 from . import heuristics, library
+from .acoustid import AcoustIdClient
 from .config import Config
 from .downloader import DownloadError, DownloadedTrack, download, sanitize_extra_args
 from .llm import LlmClient
@@ -142,6 +143,7 @@ class ReviewView(discord.ui.LayoutView):
             + (" · MusicBrainz match" if meta.musicbrainz else "")
             + f" · queue id `{self.entry.id}`",
         ]
+        lines.extend(f"-# {step}" for step in self.entry.resolve_steps)
         if self.entry.resolve_error:
             lines.append(f"-# ⚠️ {self.entry.resolve_error}")
         details = discord.ui.TextDisplay("\n".join(lines))
@@ -339,6 +341,7 @@ class MusicBot(discord.Client):
         self.http_client = httpx.AsyncClient()
         self.resolver = MetadataResolver(
             self.config,
+            AcoustIdClient(self.http_client, self.config),
             MusicBrainzClient(self.http_client, self.config.musicbrainz_contact),
             LlmClient(self.http_client, self.config),
         )
@@ -456,7 +459,7 @@ class MusicBot(discord.Client):
         if entry.edited and not overwrite_edits:
             return
         try:
-            resolution = await self.resolver.resolve(entry.info)
+            resolution = await self.resolver.resolve(entry.info, entry.audio_path)
         except Exception:
             log.exception("metadata resolution crashed for %s", entry.id)
             entry.status = "pending"
@@ -464,6 +467,7 @@ class MusicBot(discord.Client):
         else:
             entry.meta = resolution.metadata
             entry.edited = False
+            entry.resolve_steps = resolution.steps
             entry.status = "partial" if resolution.unavailable_services else "resolved"
             entry.resolve_error = (
                 f"{', '.join(resolution.unavailable_services)} unavailable; use Re-lookup later"

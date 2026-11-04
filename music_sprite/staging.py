@@ -26,6 +26,7 @@ class QueueEntry:
     status: str = "pending"
     resolve_error: str | None = None
     edited: bool = False
+    resolve_steps: list[str] = field(default_factory=list)
     meta: TrackMetadata | None = None
     _info: dict | None = field(default=None, repr=False, compare=False)
 
@@ -64,6 +65,7 @@ class QueueEntry:
             "created_at": self.created_at,
             "status": self.status,
             "resolve_error": self.resolve_error,
+            "resolve_steps": self.resolve_steps,
             "edited": self.edited,
             "meta": self.meta.to_dict() if self.meta else None,
         }

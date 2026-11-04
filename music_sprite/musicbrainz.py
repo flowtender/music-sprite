@@ -37,20 +37,29 @@ class MusicBrainzClient:
         recordings = await self._search(query)
         for recording in recordings:
             if self._matches(recording, draft, duration_seconds):
-                return self._merge(draft, recording)
+                return self._merge(draft, recording, recording["score"] / 100, "musicbrainz")
         return None
 
+    async def fetch_recording(
+        self, recording_id: str, draft: TrackMetadata, confidence: float, origin: str
+    ) -> TrackMetadata:
+        recording = await self._get(f"{API_URL}/{recording_id}", {"inc": "artists+releases+release-groups"})
+        return self._merge(draft, recording, confidence, origin)
+
     async def _search(self, query: str) -> list[dict]:
+        return (await self._get(API_URL, {"query": query, "limit": 5})).get("recordings", [])
+
+    async def _get(self, url: str, params: dict) -> dict:
         async with self._lock:
             try:
                 response = await self._http.get(
-                    API_URL,
-                    params={"query": query, "fmt": "json", "limit": 5},
+                    url,
+                    params={**params, "fmt": "json"},
                     headers={"User-Agent": self._user_agent},
                     timeout=15,
                 )
                 response.raise_for_status()
-                return response.json().get("recordings", [])
+                return response.json()
             except (httpx.HTTPError, ValueError) as error:
                 log.warning("MusicBrainz lookup failed: %s", error)
                 raise LookupUnavailable("musicbrainz") from error
@@ -76,8 +85,19 @@ class MusicBrainzClient:
             for credit in recording.get("artist-credit", [])
         )
 
-    def _merge(self, draft: TrackMetadata, recording: dict) -> TrackMetadata:
-        release = (recording.get("releases") or [{}])[0]
+    @staticmethod
+    def _pick_release(releases: list[dict]) -> dict:
+        """Prefers the earliest official studio album, then any official release, then anything."""
+
+        def rank(release: dict) -> tuple[bool, bool, str]:
+            group = release.get("release-group") or {}
+            studio_album = group.get("primary-type") == "Album" and not group.get("secondary-types")
+            return (release.get("status") != "Official", not studio_album, release.get("date") or "9999")
+
+        return min(releases, key=rank) if releases else {}
+
+    def _merge(self, draft: TrackMetadata, recording: dict, confidence: float, origin: str) -> TrackMetadata:
+        release = self._pick_release(recording.get("releases") or [])
         release_year = str(release.get("date", ""))[:4]
         ids = MusicBrainzIds(
             recording_id=recording["id"],
@@ -94,7 +114,7 @@ class MusicBrainzClient:
             artist=self._credited_artist(recording) or draft.artist,
             album=release.get("title") or draft.album,
             year=int(release_year) if release_year.isdigit() else draft.year,
-            confidence=max(draft.confidence, recording["score"] / 100),
-            origin="musicbrainz",
+            confidence=max(draft.confidence, confidence),
+            origin=origin,
             musicbrainz=ids,
         )
