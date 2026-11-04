@@ -1,319 +1,39 @@
 import asyncio
 import logging
-import math
 import shlex
 import shutil
 import time
 import uuid
-from dataclasses import replace
 
 import discord
 import httpx
 from discord import app_commands
 
-from . import heuristics, library
+from . import library
 from .acoustid import AcoustIdClient
 from .config import Config
 from .downloader import DownloadError, DownloadedTrack, download, sanitize_extra_args
 from .llm import LlmClient
 from .musicbrainz import MusicBrainzClient
+from .panels import DYNAMIC_ITEMS, build_queue_view, build_review_view, status_view, truncate
 from .resolver import MetadataResolver
 from .staging import QueueEntry, Staging
 
 log = logging.getLogger(__name__)
 
-REVIEW_TIMEOUT_SECONDS = 3600
-QUEUE_VIEW_TIMEOUT_SECONDS = 900
-QUEUE_PAGE_SIZE = 25
-MAX_REVIEWS_AT_ONCE = 10
 STATUS_EDIT_INTERVAL_SECONDS = 2.0
-# Webhook errors Discord returns once an interaction token (valid for 15 minutes) is no longer usable.
-INTERACTION_EXPIRED_CODES = frozenset({10015, 50027})
-ACCENT_BY_CONFIDENCE = ((0.85, discord.Colour.green()), (0.5, discord.Colour.gold()))
-STATUS_ICON = {"resolved": "✅", "partial": "⚠️", "pending": "⏳"}
-EDITED_ICON = "✏️"
-
-
-def status_view(text: str) -> discord.ui.LayoutView:
-    view = discord.ui.LayoutView()
-    view.add_item(discord.ui.Container(discord.ui.TextDisplay(text)))
-    return view
-
-
-def _accent(confidence: float) -> discord.Colour:
-    for threshold, colour in ACCENT_BY_CONFIDENCE:
-        if confidence >= threshold:
-            return colour
-    return discord.Colour.red()
-
-
-def _field(label: str, value: object) -> str:
-    shown = discord.utils.escape_markdown(str(value)) if value else "*none*"
-    return f"**{label}:** {shown}"
-
-
-def _truncate(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
-def entry_label(entry: QueueEntry) -> str:
-    if entry.meta and entry.meta.title:
-        return f"{entry.meta.artist or '?'} – {entry.meta.title}"
-    return entry.info.get("title") or entry.audio_file
-
-
-def entry_icon(entry: QueueEntry) -> str:
-    return EDITED_ICON if entry.edited else STATUS_ICON.get(entry.status, "⏳")
 
 
 class ThrottledStatus:
-    def __init__(self, interaction: discord.Interaction):
-        self._interaction = interaction
+    def __init__(self, message: discord.PartialMessage):
+        self._message = message
         self._last_edit = 0.0
-        self._expired = False
 
     async def show(self, text: str, force: bool = False) -> None:
         now = time.monotonic()
-        if self._expired or not (force or now - self._last_edit >= STATUS_EDIT_INTERVAL_SECONDS):
-            return
-        self._last_edit = now
-        try:
-            await self._interaction.edit_original_response(view=status_view(text))
-        except discord.HTTPException as error:
-            if error.code not in INTERACTION_EXPIRED_CODES:
-                raise
-            self._expired = True
-
-
-class EditModal(discord.ui.Modal, title="Edit metadata"):
-    def __init__(self, review: "ReviewView"):
-        super().__init__()
-        self.review = review
-        meta = review.entry.require_meta()
-        self.title_input = discord.ui.TextInput(label="Title", default=meta.title, max_length=200)
-        self.artist_input = discord.ui.TextInput(label="Artist", default=meta.artist, max_length=200, required=False)
-        self.album_input = discord.ui.TextInput(
-            label="Album (empty = single)", default=meta.album or "", max_length=200, required=False
-        )
-        self.year_input = discord.ui.TextInput(label="Year", default=str(meta.year or ""), max_length=4, required=False)
-        self.genre_input = discord.ui.TextInput(label="Genre", default=meta.genre or "", max_length=100, required=False)
-        for item in (self.title_input, self.artist_input, self.album_input, self.year_input, self.genre_input):
-            self.add_item(item)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        entry = self.review.entry
-        current = entry.require_meta()
-        year_text = self.year_input.value.strip()
-        entry.meta = replace(
-            current,
-            title=self.title_input.value.strip(),
-            artist=self.artist_input.value.strip(),
-            album=self.album_input.value.strip() or None,
-            album_artist=None,
-            year=int(year_text) if year_text.isdigit() else None,
-            genre=self.genre_input.value.strip() or None,
-            origin=current.origin if current.origin.endswith("+edited") else f"{current.origin}+edited",
-        )
-        entry.edited = True
-        self.review.bot.staging.save(entry)
-        self.review.render()
-        await interaction.response.edit_message(view=self.review)
-
-
-class ReviewView(discord.ui.LayoutView):
-    def __init__(self, bot: "MusicBot", entry: QueueEntry, note: str | None = None):
-        super().__init__(timeout=REVIEW_TIMEOUT_SECONDS)
-        self.bot = bot
-        self.entry = entry
-        self.note = note
-        if entry.meta is None:
-            entry.meta = heuristics.guess(entry.info, bot.config.known_publishers)
-
-        self.approve_button = discord.ui.Button(label="Approve", style=discord.ButtonStyle.success)
-        self.edit_button = discord.ui.Button(label="Edit", style=discord.ButtonStyle.primary)
-        self.lookup_button = discord.ui.Button(label="Re-lookup", style=discord.ButtonStyle.secondary)
-        self.close_button = discord.ui.Button(label="Close", style=discord.ButtonStyle.secondary)
-        self.approve_button.callback = self._approve
-        self.edit_button.callback = self._edit
-        self.lookup_button.callback = self._lookup
-        self.close_button.callback = self._close
-        self.render()
-
-    def render(self) -> None:
-        self.clear_items()
-        meta = self.entry.require_meta()
-        lines = [
-            f"### {discord.utils.escape_markdown(meta.title)}",
-            _field("Artist", meta.artist),
-            _field("Album", meta.album or f"{meta.title} (single)"),
-            _field("Year", meta.year),
-            _field("Genre", meta.genre),
-            f"-# source: {meta.origin} · confidence {meta.confidence:.0%}"
-            + (" · MusicBrainz match" if meta.musicbrainz else "")
-            + f" · queue id `{self.entry.id}`",
-        ]
-        lines.extend(f"-# {step}" for step in self.entry.resolve_steps)
-        if self.entry.resolve_error:
-            lines.append(f"-# ⚠️ {self.entry.resolve_error}")
-        if self.note:
-            lines.append(f"-# {self.note}")
-        details = discord.ui.TextDisplay("\n".join(lines))
-        thumbnail_url = self.entry.info.get("thumbnail")
-        body = (
-            discord.ui.Section(details, accessory=discord.ui.Thumbnail(thumbnail_url)) if thumbnail_url else details
-        )
-        buttons = discord.ui.ActionRow(self.approve_button, self.edit_button, self.lookup_button, self.close_button)
-        self.add_item(discord.ui.Container(body, discord.ui.Separator(), buttons, accent_colour=_accent(meta.confidence)))
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return self.bot.is_allowed(interaction.user.id)
-
-    async def _approve(self, interaction: discord.Interaction):
-        meta = self.entry.require_meta()
-        if not meta.artist or not meta.title:
-            await interaction.response.send_message("Artist and title are required. Use Edit first.", ephemeral=True)
-            return
-        self.stop()
-        await interaction.response.edit_message(view=status_view("Tagging and adding to library…"))
-        await interaction.edit_original_response(view=status_view(await self.bot.import_entry(self.entry)))
-
-    async def _edit(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(EditModal(self))
-
-    async def _lookup(self, interaction: discord.Interaction):
-        await interaction.response.edit_message(view=status_view("Looking up metadata…"))
-        await self.bot.resolve_entry(self.entry, overwrite_edits=True)
-        self.render()
-        await interaction.edit_original_response(view=self)
-
-    async def _close(self, interaction: discord.Interaction):
-        self.stop()
-        await interaction.response.edit_message(view=status_view(f"Closed. `{self.entry.id}` is still in the queue."))
-
-
-class QueueView(discord.ui.LayoutView):
-    def __init__(self, bot: "MusicBot", note: str | None = None):
-        super().__init__(timeout=QUEUE_VIEW_TIMEOUT_SECONDS)
-        self.bot = bot
-        self.note = note
-        self.page = 0
-        self.selected: set[str] = {entry.id for entry in bot.staging.list()[:1]}
-        self.render()
-
-    def render(self) -> None:
-        self.clear_items()
-        entries = self.bot.staging.list()
-        page_count = max(1, math.ceil(len(entries) / QUEUE_PAGE_SIZE))
-        self.page = min(self.page, page_count - 1)
-        self.selected &= {entry.id for entry in entries}
-        page_entries = entries[self.page * QUEUE_PAGE_SIZE : (self.page + 1) * QUEUE_PAGE_SIZE]
-
-        if not entries:
-            self.add_item(discord.ui.Container(discord.ui.TextDisplay("### Download queue\nEmpty.")))
-            return
-
-        lines = [
-            f"{entry_icon(entry)} `{entry.id}` {discord.utils.escape_markdown(_truncate(entry_label(entry), 70))}"
-            for entry in page_entries
-        ]
-        header = f"### Download queue · {len(entries)} track(s) · page {self.page + 1}/{page_count}"
-        legend = "-# ✅ looked up · ⚠️ lookup incomplete · ⏳ not looked up · ✏️ edited by you"
-
-        select = discord.ui.Select(
-            placeholder="Select tracks…",
-            min_values=0,
-            max_values=len(page_entries),
-            options=[
-                discord.SelectOption(
-                    label=_truncate(entry_label(entry), 100),
-                    value=entry.id,
-                    description=f"{entry.status} · {entry.meta.confidence:.0%}" if entry.meta else entry.status,
-                    default=entry.id in self.selected,
-                )
-                for entry in page_entries
-            ],
-        )
-        select.callback = self._on_select
-        self._page_ids = {entry.id for entry in page_entries}
-
-        buttons = []
-        for label, style, callback in (
-            ("Review", discord.ButtonStyle.primary, self._review),
-            ("Look up", discord.ButtonStyle.secondary, self._lookup),
-            ("Discard", discord.ButtonStyle.danger, self._discard),
-            ("◀", discord.ButtonStyle.secondary, self._previous_page),
-            ("▶", discord.ButtonStyle.secondary, self._next_page),
-        ):
-            button = discord.ui.Button(label=label, style=style)
-            button.callback = callback
-            buttons.append(button)
-        buttons[3].disabled = self.page == 0
-        buttons[4].disabled = self.page >= page_count - 1
-
-        self.add_item(
-            discord.ui.Container(
-                discord.ui.TextDisplay("\n".join([*([f"-# {self.note}"] if self.note else []), header, *lines, legend])),
-                discord.ui.ActionRow(select),
-                discord.ui.ActionRow(*buttons),
-            )
-        )
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return self.bot.is_allowed(interaction.user.id)
-
-    def _selected_entries(self) -> list[QueueEntry]:
-        found = (self.bot.staging.get(entry_id) for entry_id in self.selected)
-        return [entry for entry in found if entry]
-
-    async def _on_select(self, interaction: discord.Interaction):
-        chosen = set(interaction.data.get("values", []))
-        self.selected = (self.selected - self._page_ids) | chosen
-        await interaction.response.defer()
-
-    async def _review(self, interaction: discord.Interaction):
-        entries = self._selected_entries()[:MAX_REVIEWS_AT_ONCE]
-        if not entries:
-            await interaction.response.send_message("Select tracks first.", ephemeral=True)
-            return
-        reviews = [ReviewView(self.bot, entry) for entry in entries]
-        await interaction.response.send_message(view=reviews[0], ephemeral=True)
-        for review in reviews[1:]:
-            await interaction.followup.send(view=review, ephemeral=True)
-
-    async def _lookup(self, interaction: discord.Interaction):
-        entries = self._selected_entries()
-        if not entries:
-            await interaction.response.send_message("Select tracks first.", ephemeral=True)
-            return
-        # Lookups take several seconds each. Replace the buttons right away: the panel is rebuilt with new component
-        # ids afterwards, so clicks during the lookup would hit stale buttons and fail.
-        await interaction.response.edit_message(view=status_view(f"Looking up 1/{len(entries)}…"))
-        for position, entry in enumerate(entries, start=1):
-            if position > 1:
-                await interaction.edit_original_response(view=status_view(f"Looking up {position}/{len(entries)}…"))
-            await self.bot.resolve_entry(entry, overwrite_edits=True)
-        self.render()
-        await interaction.edit_original_response(view=self)
-
-    async def _discard(self, interaction: discord.Interaction):
-        entries = self._selected_entries()
-        if not entries:
-            await interaction.response.send_message("Select tracks first.", ephemeral=True)
-            return
-        for entry in entries:
-            self.bot.staging.remove(entry)
-        self.render()
-        await interaction.response.edit_message(view=self)
-
-    async def _previous_page(self, interaction: discord.Interaction):
-        self.page -= 1
-        self.render()
-        await interaction.response.edit_message(view=self)
-
-    async def _next_page(self, interaction: discord.Interaction):
-        self.page += 1
-        self.render()
-        await interaction.response.edit_message(view=self)
+        if force or now - self._last_edit >= STATUS_EDIT_INTERVAL_SECONDS:
+            self._last_edit = now
+            await self._message.edit(view=status_view(text))
 
 
 class QueueCommands(app_commands.Group):
@@ -326,11 +46,11 @@ class QueueCommands(app_commands.Group):
 
     @app_commands.command(name="list", description="Show downloaded tracks; select some to review, look up or discard")
     async def list_queue(self, interaction: discord.Interaction):
-        await interaction.response.send_message(view=QueueView(self.bot), ephemeral=True)
+        await interaction.response.send_message(view=build_queue_view(self.bot))
 
     @app_commands.command(name="lookup", description="Retry metadata lookup for tracks that are pending or incomplete")
     async def lookup(self, interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        await interaction.response.defer(thinking=True)
         count = await self.bot.resolve_unfinished()
         await interaction.followup.send(f"Looked up {count} track(s). Use `{self.bot.queue_list_command}` to review them.")
 
@@ -351,6 +71,7 @@ class MusicBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.http_client = httpx.AsyncClient()
+        self.add_dynamic_items(*DYNAMIC_ITEMS)
         self.resolver = MetadataResolver(
             self.config,
             AcoustIdClient(self.http_client, self.config),
@@ -418,33 +139,36 @@ class MusicBot(discord.Client):
             await interaction.response.send_message(f"Rejected: {error}", ephemeral=True)
             return
 
-        await interaction.response.send_message(view=status_view("Downloading…"), ephemeral=True)
-        await self._run_download(interaction, url, extra_args)
+        await interaction.response.send_message(view=status_view("Downloading…"))
+        original = await interaction.original_response()
+        # Interaction tokens expire after 15 minutes but downloads can run for hours, so edit with the bot token.
+        assert interaction.channel_id is not None
+        channel = self.get_partial_messageable(interaction.channel_id, guild_id=interaction.guild_id)
+        await self._run_download(channel.get_partial_message(original.id), url, extra_args, interaction.user.id)
 
-    async def _run_download(self, interaction: discord.Interaction, url: str, extra_args: list[str]) -> None:
-        status = ThrottledStatus(interaction)
+    async def _run_download(self, reply: discord.PartialMessage, url: str, extra_args: list[str], user_id: int) -> None:
+        status = ThrottledStatus(reply)
         batch_id = uuid.uuid4().hex[:8]
         incoming = self.staging.incoming_dir(batch_id)
         entries: list[QueueEntry] = []
 
         async def adopt(track: DownloadedTrack) -> None:
-            entries.append(self.staging.adopt(track, url, interaction.user.id, batch_id))
+            entries.append(self.staging.adopt(track, url, user_id, batch_id))
             await status.show(f"Downloaded {len(entries)} track(s)…")
 
         try:
             async with self._download_slots:
                 failed_items = await download(url, extra_args, incoming, self.config.max_playlist_items, adopt)
         except DownloadError as error:
-            await self._finish(interaction, f"Download failed:\n```\n{_truncate(str(error), 1500)}\n```")
+            await reply.edit(view=status_view(f"Download failed:\n```\n{truncate(str(error), 1500)}\n```"))
             return
         except Exception:
             log.exception("download failed for %s", url)
-            await self._finish(interaction, "Download failed unexpectedly; see the service log.")
+            await reply.edit(view=status_view("Download failed unexpectedly; see the service log."))
             return
         finally:
             shutil.rmtree(incoming, ignore_errors=True)
 
-        view: discord.ui.LayoutView | None = None
         try:
             imported = 0
             for position, entry in enumerate(entries, start=1):
@@ -455,26 +179,15 @@ class MusicBot(discord.Client):
             waiting = [entry for entry in entries if self.staging.get(entry.id)]
             summary = self._batch_summary(entries, waiting, imported, len(failed_items))
             if len(waiting) == 1:
-                view = ReviewView(self, waiting[0], note=summary)
+                view = build_review_view(self, waiting[0], note=summary)
             elif waiting:
-                view = QueueView(self, note=summary)
-            text = f"{summary} Use `{self.queue_list_command}` to review." if waiting else summary
+                view = build_queue_view(self, note=summary)
+            else:
+                view = status_view(summary)
         except Exception:
             log.exception("lookup stage failed for %s", url)
-            text = f"Queued {len(entries)} track(s), but metadata lookup crashed; see the service log."
-        await self._finish(interaction, text, view)
-
-    async def _finish(self, interaction: discord.Interaction, text: str, view: discord.ui.LayoutView | None = None) -> None:
-        try:
-            await interaction.edit_original_response(view=view if view is not None else status_view(text))
-        except discord.HTTPException as error:
-            if error.code not in INTERACTION_EXPIRED_CODES:
-                raise
-            # Long downloads outlive the interaction token, so fall back to a DM with the plain-text result.
-            try:
-                await interaction.user.send(text)
-            except discord.HTTPException as dm_error:
-                log.warning("could not deliver the finished download to user %s: %s", interaction.user.id, dm_error)
+            view = status_view(f"Queued {len(entries)} track(s), but metadata lookup crashed; see the service log.")
+        await reply.edit(view=view)
 
     def _qualifies_for_auto_import(self, entry: QueueEntry) -> bool:
         threshold = self.config.auto_import_confidence
@@ -484,15 +197,19 @@ class MusicBot(discord.Client):
             and entry.meta
             and entry.meta.artist
             and entry.meta.confidence >= threshold
+            and not entry.candidates
         )
 
     def _batch_summary(self, entries: list[QueueEntry], waiting: list[QueueEntry], imported: int, failed_items: int) -> str:
         incomplete = sum(entry.status != "resolved" for entry in waiting)
+        needs_choice = sum(bool(entry.candidates) for entry in waiting)
         parts = [f"Downloaded {len(entries)} track(s)."]
         if imported:
             parts.append(f"{imported} added to the library automatically.")
         if waiting:
             parts.append(f"{len(waiting)} waiting in the queue ({incomplete} with incomplete lookup).")
+        if needs_choice:
+            parts.append(f"{needs_choice} need a release choice.")
         if failed_items:
             parts.append(f"{failed_items} item(s) failed to download.")
         return " ".join(parts)
@@ -509,6 +226,8 @@ class MusicBot(discord.Client):
         else:
             entry.meta = resolution.metadata
             entry.edited = False
+            entry.candidates = resolution.candidates
+            entry.candidate_index = 0 if resolution.candidates else None
             entry.resolve_steps = resolution.steps
             entry.status = "partial" if resolution.unavailable_services else "resolved"
             entry.resolve_error = (

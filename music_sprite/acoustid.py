@@ -16,11 +16,13 @@ API_URL = "https://api.acoustid.org/v2/lookup"
 MIN_SCORE = 0.9
 FINGERPRINT_SECONDS = 120
 FPCALC_TIMEOUT_SECONDS = 60
+DURATION_TOLERANCE_SECONDS = 15
+MAX_CANDIDATES = 5
 
 
 @dataclass
 class AcoustIdMatch:
-    recording_id: str
+    recording_ids: list[str]
     score: float
 
 
@@ -61,15 +63,21 @@ class AcoustIdClient:
 
     @staticmethod
     def _best_match(results: list[dict], duration: float) -> AcoustIdMatch | None:
-        for result in sorted(results, key=lambda item: item.get("score", 0), reverse=True):
-            score = result.get("score", 0)
-            recordings = result.get("recordings") or []
-            if score < MIN_SCORE:
-                return None
-            if recordings:
-                closest = min(recordings, key=lambda item: abs((item.get("duration") or duration) - duration))
-                return AcoustIdMatch(closest["id"], score)
-        return None
+        """Collects the recordings of every result tied at the best score that are close to our length."""
+        scored = [result for result in results if result.get("recordings")]
+        if not scored:
+            return None
+        best = max(result.get("score", 0) for result in scored)
+        if best < MIN_SCORE:
+            return None
+        seen: dict[str, float] = {}
+        for result in scored:
+            if result.get("score", 0) == best:
+                for recording in result["recordings"]:
+                    seen.setdefault(recording["id"], abs((recording.get("duration") or duration) - duration))
+        by_closeness = sorted(seen, key=seen.get)
+        near = [recording_id for recording_id in by_closeness if seen[recording_id] <= DURATION_TOLERANCE_SECONDS]
+        return AcoustIdMatch((near or by_closeness[:1])[:MAX_CANDIDATES], best)
 
     @staticmethod
     async def _fingerprint(audio_path: Path) -> tuple[str, float]:

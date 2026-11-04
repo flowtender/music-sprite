@@ -27,6 +27,8 @@ class QueueEntry:
     resolve_error: str | None = None
     edited: bool = False
     resolve_steps: list[str] = field(default_factory=list)
+    candidates: list[TrackMetadata] = field(default_factory=list)
+    candidate_index: int | None = None
     meta: TrackMetadata | None = None
     _info: dict | None = field(default=None, repr=False, compare=False)
 
@@ -66,6 +68,8 @@ class QueueEntry:
             "status": self.status,
             "resolve_error": self.resolve_error,
             "resolve_steps": self.resolve_steps,
+            "candidates": [candidate.to_dict() for candidate in self.candidates],
+            "candidate_index": self.candidate_index,
             "edited": self.edited,
             "meta": self.meta.to_dict() if self.meta else None,
         }
@@ -73,7 +77,13 @@ class QueueEntry:
     @classmethod
     def from_json(cls, directory: Path, data: dict) -> "QueueEntry":
         meta = data.pop("meta")
-        return cls(directory=directory, meta=TrackMetadata.from_dict(meta) if meta else None, **data)
+        candidates = [TrackMetadata.from_dict(candidate) for candidate in data.pop("candidates", [])]
+        return cls(
+            directory=directory,
+            meta=TrackMetadata.from_dict(meta) if meta else None,
+            candidates=candidates,
+            **data,
+        )
 
 
 class Staging:

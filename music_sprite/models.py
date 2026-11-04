@@ -10,6 +10,7 @@ class MusicBrainzIds:
     recording_id: str
     release_id: str | None = None
     artist_ids: list[str] = field(default_factory=list)
+    length_seconds: float | None = None
 
 
 @dataclass

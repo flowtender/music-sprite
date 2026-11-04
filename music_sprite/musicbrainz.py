@@ -30,15 +30,21 @@ class MusicBrainzClient:
         self._user_agent = f"music-sprite/0.1 ({contact or 'no-contact'})"
         self._lock = asyncio.Lock()
 
-    async def enrich(self, draft: TrackMetadata, duration_seconds: float | None) -> TrackMetadata | None:
+    async def enrich(self, draft: TrackMetadata, duration_seconds: float | None) -> list[TrackMetadata]:
+        """Returns every recording that matches at the best search score."""
         if not draft.artist or not draft.title:
-            return None
+            return []
         query = f'recording:"{_escape(draft.title)}" AND artist:"{_escape(draft.artist)}"'
-        recordings = await self._search(query)
-        for recording in recordings:
-            if self._matches(recording, draft, duration_seconds):
-                return self._merge(draft, recording, recording["score"] / 100, "musicbrainz")
-        return None
+        matching = [
+            recording
+            for recording in await self._search(query)
+            if self._matches(recording, draft, duration_seconds)
+        ]
+        if not matching:
+            return []
+        best_score = max(recording["score"] for recording in matching)
+        tied = [recording for recording in matching if recording["score"] == best_score]
+        return [self._merge(draft, recording, best_score / 100, "musicbrainz") for recording in tied]
 
     async def fetch_recording(
         self, recording_id: str, draft: TrackMetadata, confidence: float, origin: str
@@ -99,6 +105,7 @@ class MusicBrainzClient:
     def _merge(self, draft: TrackMetadata, recording: dict, confidence: float, origin: str) -> TrackMetadata:
         release = self._pick_release(recording.get("releases") or [])
         release_year = str(release.get("date", ""))[:4]
+        length_ms = recording.get("length")
         ids = MusicBrainzIds(
             recording_id=recording["id"],
             release_id=release.get("id"),
@@ -107,6 +114,7 @@ class MusicBrainzClient:
                 for credit in recording.get("artist-credit", [])
                 if "artist" in credit
             ],
+            length_seconds=length_ms / 1000 if length_ms else None,
         )
         return replace(
             draft,

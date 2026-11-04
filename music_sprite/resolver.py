@@ -16,10 +16,24 @@ class Resolution:
     metadata: TrackMetadata
     unavailable_services: list[str]
     steps: list[str] = field(default_factory=list)
+    # Two or more equally good matches for the user to choose between; empty when the match is unambiguous.
+    candidates: list[TrackMetadata] = field(default_factory=list)
 
 
 def _describe(meta: TrackMetadata) -> str:
     return f"{meta.artist or '?'} – {meta.title}"
+
+
+def _distinct(matches: list[TrackMetadata]) -> list[TrackMetadata]:
+    """Drops matches that would look identical to the user (different recordings of the same release)."""
+    seen: set[tuple] = set()
+    unique = []
+    for match in matches:
+        key = (match.artist.casefold(), match.title.casefold(), (match.album or "").casefold(), match.year)
+        if key not in seen:
+            seen.add(key)
+            unique.append(match)
+    return unique
 
 
 class MetadataResolver:
@@ -35,13 +49,13 @@ class MetadataResolver:
         draft = heuristics.guess(info, self._config.known_publishers)
         steps = [f"Heuristic ({draft.origin}): {_describe(draft)}"]
 
-        identified = await self._identify_by_audio(audio_path, draft, unavailable, steps)
-        if identified:
-            return Resolution(self._keep_source_genre(identified, draft), unavailable, steps)
+        matches = await self._identify_by_audio(audio_path, draft, unavailable, steps)
+        if matches:
+            return self._resolution(matches, draft, duration, unavailable, steps)
 
-        matched = await self._enrich(draft, duration, unavailable, steps)
-        if matched:
-            return Resolution(self._keep_source_genre(matched, draft), unavailable, steps)
+        matches = await self._enrich(draft, duration, unavailable, steps)
+        if matches:
+            return self._resolution(matches, draft, duration, unavailable, steps)
 
         if draft.confidence >= TRUSTED_SOURCE_CONFIDENCE:
             steps.append("LLM: skipped (source tags already trusted)")
@@ -56,58 +70,88 @@ class MetadataResolver:
             steps.append("LLM: unavailable")
             return Resolution(draft, [*unavailable, str(error)], steps)
         steps.append(f"LLM ({refined.origin}): {_describe(refined)} (confidence {refined.confidence:.0%})")
-        matched = await self._enrich(refined, duration, unavailable, steps)
-        if matched:
-            return Resolution(self._keep_source_genre(matched, refined), unavailable, steps)
+        matches = await self._enrich(refined, duration, unavailable, steps)
+        if matches:
+            return self._resolution(matches, refined, duration, unavailable, steps)
         return Resolution(refined, unavailable, steps)
+
+    def _resolution(
+        self,
+        matches: list[TrackMetadata],
+        earlier: TrackMetadata,
+        duration: float | None,
+        unavailable: list[str],
+        steps: list[str],
+    ) -> Resolution:
+        def rank(match: TrackMetadata) -> tuple[int, int]:
+            # Closest in length first (to the second, so 1.0s vs 1.04s is a tie), then the earliest release.
+            length = match.musicbrainz.length_seconds if match.musicbrainz else None
+            gap = round(abs(length - duration)) if length and duration else 0
+            return gap, match.year or 9999
+
+        ranked = [self._keep_source_genre(match, earlier) for match in sorted(_distinct(matches), key=rank)]
+        return Resolution(ranked[0], unavailable, steps, candidates=ranked if len(ranked) > 1 else [])
 
     async def _identify_by_audio(
         self, audio_path: Path, draft: TrackMetadata, unavailable: list[str], steps: list[str]
-    ) -> TrackMetadata | None:
+    ) -> list[TrackMetadata]:
         reason = self._acoustid.disabled_reason
         if reason:
             steps.append(f"AcoustID: skipped ({reason})")
-            return None
+            return []
         try:
             match = await self._acoustid.identify(audio_path)
         except LookupUnavailable as error:
             unavailable.append(str(error))
             steps.append(f"AcoustID: {error} unavailable")
-            return None
+            return []
         if match is None:
             steps.append("AcoustID: no confident match")
-            return None
-        try:
-            identified = await self._musicbrainz.fetch_recording(
-                match.recording_id, draft, match.score, "acoustid+musicbrainz"
-            )
-        except LookupUnavailable as error:
-            unavailable.append(str(error))
+            return []
+
+        identified: list[TrackMetadata] = []
+        for recording_id in match.recording_ids:
+            try:
+                identified.append(
+                    await self._musicbrainz.fetch_recording(recording_id, draft, match.score, "acoustid+musicbrainz")
+                )
+            except LookupUnavailable as error:
+                unavailable.append(str(error))
+                break
+        if not identified:
             steps.append("AcoustID: matched a recording but MusicBrainz is unavailable")
-            return None
-        steps.append(f"AcoustID: matched {_describe(identified)} ({match.score:.0%})")
+            return []
+        self._note_matches(steps, "AcoustID", _distinct(identified), f"{match.score:.0%}")
         return identified
 
     async def _enrich(
         self, draft: TrackMetadata, duration: float | None, unavailable: list[str], steps: list[str]
-    ) -> TrackMetadata | None:
+    ) -> list[TrackMetadata]:
         if "musicbrainz" in unavailable:
             steps.append("MusicBrainz search: skipped (unavailable)")
-            return None
+            return []
         if not draft.artist or not draft.title:
             steps.append("MusicBrainz search: skipped (no artist or title to search for)")
-            return None
+            return []
         try:
-            matched = await self._musicbrainz.enrich(draft, duration)
+            matches = await self._musicbrainz.enrich(draft, duration)
         except LookupUnavailable as error:
             unavailable.append(str(error))
             steps.append("MusicBrainz search: unavailable")
-            return None
-        if matched is None:
+            return []
+        if not matches:
             steps.append(f"MusicBrainz search: no match for {_describe(draft)}")
+            return []
+        self._note_matches(steps, "MusicBrainz search", _distinct(matches), None)
+        return matches
+
+    @staticmethod
+    def _note_matches(steps: list[str], source: str, matches: list[TrackMetadata], score: str | None) -> None:
+        suffix = f" ({score})" if score else ""
+        if len(matches) == 1:
+            steps.append(f"{source}: matched {_describe(matches[0])}{suffix}")
         else:
-            steps.append(f"MusicBrainz search: matched {_describe(matched)}")
-        return matched
+            steps.append(f"{source}: {len(matches)} equally good matches{suffix}; pick one in the review")
 
     @staticmethod
     def _keep_source_genre(matched: TrackMetadata, earlier: TrackMetadata) -> TrackMetadata:
