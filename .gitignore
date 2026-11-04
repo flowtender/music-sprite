@@ -1,0 +1,6 @@
+__pycache__/
+*.egg-info/
+.venv/
+venv/
+music-sprite.env
+.claude/settings.local.json

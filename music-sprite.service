@@ -1,0 +1,15 @@
+[Unit]
+Description=Music Sprite Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=music-sprite
+StateDirectory=music-sprite
+EnvironmentFile=/etc/music-sprite.env
+ExecStart=/opt/music-sprite/venv/bin/music-sprite
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
