@@ -9,6 +9,17 @@ def _id_set(name: str) -> frozenset[int]:
     return frozenset(int(part) for part in os.environ.get(name, "").replace(",", " ").split())
 
 
+def _flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be true or false, got {raw!r}")
+
+
 def _name_set(name: str, default: str) -> frozenset[str]:
     raw = os.environ.get(name, default)
     return frozenset(part.strip().casefold() for part in raw.split(",") if part.strip())
@@ -18,7 +29,7 @@ def _name_set(name: str, default: str) -> frozenset[str]:
 class Config:
     discord_token: str
     guild_id: int | None
-    channel_ids: frozenset[int]
+    global_commands: bool
     allowed_user_ids: frozenset[int]
 
     music_root: Path
@@ -47,15 +58,18 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         state_dir = Path(os.environ.get("STATE_DIRECTORY", "/var/lib/music-sprite"))
-        guild_id = os.environ.get("DISCORD_GUILD_ID", "")
+        guild_id = int(os.environ.get("DISCORD_GUILD_ID") or 0) or None
+        global_commands = _flag("DISCORD_GLOBAL_COMMANDS", True)
+        if guild_id is None and not global_commands:
+            raise ValueError("Set DISCORD_GUILD_ID or enable DISCORD_GLOBAL_COMMANDS; otherwise no commands would be registered")
         auto_import = os.environ.get("AUTO_IMPORT_CONFIDENCE", "")
         call_log = os.environ.get("LLM_CALL_LOG", str(state_dir / "llm_calls.jsonl"))
         template = os.environ.get("LIBRARY_PATH_TEMPLATE", DEFAULT_TEMPLATE)
         validate_template(template)
         return cls(
             discord_token=os.environ["DISCORD_TOKEN"],
-            guild_id=int(guild_id) if guild_id else None,
-            channel_ids=_id_set("DISCORD_CHANNEL_IDS"),
+            guild_id=guild_id,
+            global_commands=global_commands,
             allowed_user_ids=_id_set("DISCORD_ALLOWED_USER_IDS"),
             music_root=Path(os.environ.get("MUSIC_ROOT", "/srv/music")),
             library_path_template=template,

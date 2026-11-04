@@ -13,7 +13,7 @@ from discord import app_commands
 
 from . import heuristics, library
 from .config import Config
-from .downloader import DownloadError, DownloadedTrack, RejectedArguments, download, sanitize_extra_args
+from .downloader import DownloadError, DownloadedTrack, download, sanitize_extra_args
 from .llm import LlmClient
 from .musicbrainz import MusicBrainzClient
 from .resolver import MetadataResolver
@@ -29,17 +29,6 @@ STATUS_EDIT_INTERVAL_SECONDS = 2.0
 ACCENT_BY_CONFIDENCE = ((0.85, discord.Colour.green()), (0.5, discord.Colour.gold()))
 STATUS_ICON = {"resolved": "✅", "partial": "⚠️", "pending": "⏳"}
 EDITED_ICON = "✏️"
-
-
-def parse_request(content: str) -> tuple[str, list[str]] | None:
-    try:
-        tokens = shlex.split(content)
-    except ValueError:
-        return None
-    for index, token in enumerate(tokens):
-        if token.startswith(("http://", "https://")):
-            return token, tokens[:index] + tokens[index + 1 :]
-    return None
 
 
 def status_view(text: str) -> discord.ui.LayoutView:
@@ -75,7 +64,7 @@ def entry_icon(entry: QueueEntry) -> str:
 
 
 class ThrottledStatus:
-    def __init__(self, message: discord.Message):
+    def __init__(self, message: discord.PartialMessage):
         self._message = message
         self._last_edit = 0.0
 
@@ -319,10 +308,7 @@ class QueueCommands(app_commands.Group):
         self.bot = bot
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if self.bot.is_allowed(interaction.user.id):
-            return True
-        await interaction.response.send_message("You are not allowed to use this bot.", ephemeral=True)
-        return False
+        return await self.bot.ensure_allowed(interaction)
 
     @app_commands.command(name="list", description="Show downloaded tracks; select some to review, look up or discard")
     async def list_queue(self, interaction: discord.Interaction):
@@ -337,14 +323,11 @@ class QueueCommands(app_commands.Group):
 
 class MusicBot(discord.Client):
     def __init__(self, config: Config):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(intents=intents)
+        super().__init__(intents=discord.Intents.default())
         self.config = config
         self.tree = app_commands.CommandTree(self)
         self.staging = Staging(config.queue_dir)
         self._download_slots = asyncio.Semaphore(config.max_concurrent_downloads)
-        self._tasks: set[asyncio.Task] = set()
         self._importing: set[str] = set()
         self.http_client: httpx.AsyncClient
         self.resolver: MetadataResolver
@@ -359,9 +342,25 @@ class MusicBot(discord.Client):
             MusicBrainzClient(self.http_client, self.config.musicbrainz_contact),
             LlmClient(self.http_client, self.config),
         )
-        guild = discord.Object(id=self.config.guild_id) if self.config.guild_id else None
-        self.tree.add_command(QueueCommands(self), guild=guild)
-        await self.tree.sync(guild=guild)
+        if self.config.guild_id:
+            self._register_commands(discord.Object(id=self.config.guild_id), contexts=None)
+            await self.tree.sync(guild=discord.Object(id=self.config.guild_id))
+        if self.config.global_commands:
+            # With a guild configured, the global copies cover DMs only so servers don't list every command twice.
+            dm_only = (
+                app_commands.AppCommandContext(guild=False, dm_channel=True, private_channel=False)
+                if self.config.guild_id
+                else None
+            )
+            self._register_commands(None, contexts=dm_only)
+        # Always sync the global set, even when empty, so turning the toggle off removes previously registered commands.
+        await self.tree.sync()
+
+    def _register_commands(self, guild: discord.Object | None, contexts: app_commands.AppCommandContext | None) -> None:
+        for command in (QueueCommands(self), make_download_command()):
+            if contexts is not None:
+                command.allowed_contexts = contexts
+            self.tree.add_command(command, guild=guild)
 
     async def close(self) -> None:
         await super().close()
@@ -370,33 +369,37 @@ class MusicBot(discord.Client):
     async def on_ready(self) -> None:
         log.info("logged in as %s", self.user)
 
-    async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or message.channel.id not in self.config.channel_ids:
-            return
-        if not self.is_allowed(message.author.id):
-            return
-        request = parse_request(message.content)
-        if request is None:
-            return
-        task = asyncio.create_task(self._handle_request(message, *request))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+    async def ensure_allowed(self, interaction: discord.Interaction) -> bool:
+        if self.is_allowed(interaction.user.id):
+            return True
+        await interaction.response.send_message("You are not allowed to use this bot.", ephemeral=True)
+        return False
 
-    async def _handle_request(self, message: discord.Message, url: str, raw_args: list[str]) -> None:
+    async def start_download(self, interaction: discord.Interaction, url: str, options: str) -> None:
+        url = url.strip()
         try:
-            extra_args = sanitize_extra_args(raw_args)
-        except RejectedArguments as error:
-            await message.reply(view=status_view(f"Rejected: {error}"), mention_author=False)
+            if not url.startswith(("http://", "https://")):
+                raise ValueError("the URL must start with http:// or https://")
+            extra_args = sanitize_extra_args(shlex.split(options))
+        except ValueError as error:
+            await interaction.response.send_message(f"Rejected: {error}", ephemeral=True)
             return
 
-        reply = await message.reply(view=status_view("Downloading…"), mention_author=False)
+        await interaction.response.send_message(view=status_view("Downloading…"))
+        original = await interaction.original_response()
+        # Interaction tokens expire after 15 minutes but downloads can run for hours, so edit with the bot token.
+        assert interaction.channel_id is not None
+        channel = self.get_partial_messageable(interaction.channel_id, guild_id=interaction.guild_id)
+        await self._run_download(channel.get_partial_message(original.id), url, extra_args, interaction.user.id)
+
+    async def _run_download(self, reply: discord.PartialMessage, url: str, extra_args: list[str], user_id: int) -> None:
         status = ThrottledStatus(reply)
         batch_id = uuid.uuid4().hex[:8]
         incoming = self.staging.incoming_dir(batch_id)
         entries: list[QueueEntry] = []
 
         async def adopt(track: DownloadedTrack) -> None:
-            entries.append(self.staging.adopt(track, url, message.author.id, batch_id))
+            entries.append(self.staging.adopt(track, url, user_id, batch_id))
             await status.show(f"Downloaded {len(entries)} track(s)…")
 
         try:
@@ -492,3 +495,18 @@ class MusicBot(discord.Client):
         artist = discord.utils.escape_markdown(meta.artist)
         title = discord.utils.escape_markdown(meta.title)
         return f"Added **{artist} – {title}**\n-# {relative}"
+
+
+@app_commands.describe(url="Link to download", options="Optional yt-dlp options, e.g. --no-playlist --playlist-items 1-5")
+async def _download_callback(interaction: discord.Interaction, url: str, options: str = "") -> None:
+    bot = interaction.client
+    assert isinstance(bot, MusicBot)
+    if await bot.ensure_allowed(interaction):
+        await bot.start_download(interaction, url, options)
+
+
+def make_download_command() -> app_commands.Command:
+    # A fresh instance per registration: contexts differ between the guild and global copies.
+    return app_commands.Command(
+        name="download", description="Download a track or playlist into the queue", callback=_download_callback
+    )
