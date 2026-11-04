@@ -285,8 +285,12 @@ class QueueView(discord.ui.LayoutView):
         if not entries:
             await interaction.response.send_message("Select tracks first.", ephemeral=True)
             return
-        await interaction.response.defer()
-        for entry in entries:
+        # Lookups take several seconds each. Replace the buttons right away: the panel is rebuilt with new component
+        # ids afterwards, so clicks during the lookup would hit stale buttons and fail.
+        await interaction.response.edit_message(view=status_view(f"Looking up 1/{len(entries)}…"))
+        for position, entry in enumerate(entries, start=1):
+            if position > 1:
+                await interaction.edit_original_response(view=status_view(f"Looking up {position}/{len(entries)}…"))
             await self.bot.resolve_entry(entry, overwrite_edits=True)
         self.render()
         await interaction.edit_original_response(view=self)
