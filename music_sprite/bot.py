@@ -16,8 +16,8 @@ from .config import Config
 from .downloader import DownloadError, DownloadedTrack, download, sanitize_extra_args
 from .llm import LlmClient
 from .musicbrainz import MusicBrainzClient
-from .panels import DYNAMIC_ITEMS, build_queue_view, build_review_view, status_view, truncate
-from .resolver import MetadataResolver
+from .panels import DYNAMIC_ITEMS, build_queue_view, build_review_view, lookup_progress, lookup_status, status_view, truncate
+from .resolver import MetadataResolver, ProgressCallback
 from .staging import QueueEntry, Staging
 
 log = logging.getLogger(__name__)
@@ -173,9 +173,14 @@ class MusicBot(discord.Client):
 
         try:
             imported = 0
+
+            # Lookup steps are infrequent and each one is worth seeing, so they skip the download-progress throttle.
+            async def display(text: str) -> None:
+                await status.show(text, force=True)
+
             for position, entry in enumerate(entries, start=1):
-                await status.show(f"Looking up metadata {position}/{len(entries)}…")
-                await self.resolve_entry(entry)
+                await display(lookup_status(entry, position, len(entries)))
+                await self.resolve_entry(entry, progress=lookup_progress(entry, position, len(entries), display))
                 if self._qualifies_for_auto_import(entry):
                     imported += "Added" in await self.import_entry(entry)
             waiting = [entry for entry in entries if self.staging.get(entry.id)]
@@ -216,11 +221,13 @@ class MusicBot(discord.Client):
             parts.append(f"{failed_items} item(s) failed to download.")
         return " ".join(parts)
 
-    async def resolve_entry(self, entry: QueueEntry, overwrite_edits: bool = False) -> None:
+    async def resolve_entry(
+        self, entry: QueueEntry, overwrite_edits: bool = False, progress: ProgressCallback | None = None
+    ) -> None:
         if entry.edited and not overwrite_edits:
             return
         try:
-            resolution = await self.resolver.resolve(entry.info, entry.audio_path)
+            resolution = await self.resolver.resolve(entry.info, entry.audio_path, progress)
         except Exception:
             log.exception("metadata resolution crashed for %s", entry.id)
             entry.status = "pending"

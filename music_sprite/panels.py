@@ -7,6 +7,7 @@ memory, so panels keep working after the bot restarts.
 
 import math
 import re
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -26,6 +27,7 @@ from discord.ui import (
 
 from . import heuristics
 from .models import TrackMetadata
+from .resolver import ProgressCallback
 from .staging import QueueEntry
 
 if TYPE_CHECKING:
@@ -82,6 +84,35 @@ def entry_icon(entry: QueueEntry) -> str:
     if entry.candidates:
         return CHOICE_ICON
     return STATUS_ICON.get(entry.status, "⏳")
+
+
+STEP_MAX_CHARS = 300
+
+
+def lookup_status(entry: QueueEntry, position: int, total: int, steps: Sequence[str] = (), working: str | None = None) -> str:
+    """The text shown while a track is being looked up: what each source found so far and what is running now."""
+    counter = f" {position}/{total}" if total > 1 else ""
+    lines = [f"**Looking up metadata{counter}** · {discord.utils.escape_markdown(entry_label(entry))}"]
+    lines.extend(f"-# {truncate(step, STEP_MAX_CHARS)}" for step in steps)
+    if working:
+        lines.append(f"-# ⏳ {working}…")
+    return "\n".join(lines)
+
+
+def lookup_progress(
+    entry: QueueEntry, position: int, total: int, display: Callable[[str], Awaitable[None]]
+) -> ProgressCallback:
+    async def update(steps: list[str], working: str | None) -> None:
+        await display(lookup_status(entry, position, total, steps, working))
+
+    return update
+
+
+def edit_status_of(interaction: discord.Interaction) -> Callable[[str], Awaitable[None]]:
+    async def display(text: str) -> None:
+        await interaction.edit_original_response(view=status_view(text))
+
+    return display
 
 
 def _bot(interaction: discord.Interaction) -> "MusicBot":
@@ -213,11 +244,13 @@ class QueueAction(_AllowedUsersOnly, DynamicItem[Button], template=r"ms:q:(?P<ac
                 await interaction.followup.send(view=review)
         elif self.action == "lookup":
             # Lookups take several seconds each; swap the buttons for progress so nothing is clicked meanwhile.
-            await interaction.response.edit_message(view=status_view(f"Looking up 1/{len(entries)}…"))
+            await interaction.response.edit_message(view=status_view(lookup_status(entries[0], 1, len(entries))))
+            display = edit_status_of(interaction)
             for position, entry in enumerate(entries, start=1):
                 if position > 1:
-                    await interaction.edit_original_response(view=status_view(f"Looking up {position}/{len(entries)}…"))
-                await bot.resolve_entry(entry, overwrite_edits=True)
+                    await display(lookup_status(entry, position, len(entries)))
+                progress = lookup_progress(entry, position, len(entries), display)
+                await bot.resolve_entry(entry, overwrite_edits=True, progress=progress)
             view = build_queue_view(bot, page=self.page, selected={entry.id for entry in entries}, note=note)
             await interaction.edit_original_response(view=view)
         else:
@@ -350,8 +383,9 @@ class ReviewAction(_AllowedUsersOnly, DynamicItem[Button], template=r"ms:r:(?P<a
         elif self.action == "edit":
             await interaction.response.send_modal(EditModal(bot, entry, note))
         elif self.action == "lookup":
-            await interaction.response.edit_message(view=status_view("Looking up metadata…"))
-            await bot.resolve_entry(entry, overwrite_edits=True)
+            await interaction.response.edit_message(view=status_view(lookup_status(entry, 1, 1)))
+            progress = lookup_progress(entry, 1, 1, edit_status_of(interaction))
+            await bot.resolve_entry(entry, overwrite_edits=True, progress=progress)
             await interaction.edit_original_response(view=build_review_view(bot, entry, note=note))
         else:
             await interaction.response.edit_message(view=status_view(f"Closed. `{entry.id}` is still in the queue."))
@@ -452,7 +486,7 @@ def build_review_view(bot: "MusicBot", entry: QueueEntry, note: str | None = Non
         + (" · MusicBrainz match" if meta.musicbrainz else "")
         + f" · queue id `{entry.id}`",
     ]
-    lines.extend(f"-# {step}" for step in entry.resolve_steps)
+    lines.extend(f"-# {truncate(step, STEP_MAX_CHARS)}" for step in entry.resolve_steps)
     if entry.resolve_error:
         lines.append(f"-# ⚠️ {entry.resolve_error}")
     details = TextDisplay("\n".join(lines))
