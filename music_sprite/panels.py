@@ -328,13 +328,26 @@ REVIEW_ACTIONS = {
 }
 
 
+def _track_position(meta: TrackMetadata) -> str | None:
+    release = meta.release
+    if not release.track_number:
+        return None
+    position = f"{release.track_number}/{release.track_total}" if release.track_total else str(release.track_number)
+    if release.disc_total and release.disc_total > 1:
+        position += f" · disc {release.disc_number}/{release.disc_total}"
+    return position
+
+
 def describe_candidate(meta: TrackMetadata) -> str:
     album = discord.utils.escape_markdown(meta.album or f"{meta.title} (single)")
-    year = f" ({meta.year})" if meta.year else ""
+    date = meta.release.release_date or meta.year
+    year = f" ({date})" if date else ""
     length = meta.musicbrainz.length_seconds if meta.musicbrainz else None
     duration = f" · {int(length // 60)}:{int(length % 60):02d}" if length else ""
     credit = discord.utils.escape_markdown(f"{meta.artist} – {meta.title}")
-    return f"**{truncate(album, 120)}**{year}\n-# {truncate(credit, 150)}{duration}"
+    extras = [f"track {_track_position(meta)}" if _track_position(meta) else None, meta.release.label, meta.release.country]
+    more = "".join(f" · {discord.utils.escape_markdown(extra)}" for extra in extras if extra)
+    return f"**{truncate(album, 120)}**{year}\n-# {truncate(credit, 150)}{duration}{more}"
 
 
 async def _gone(interaction: discord.Interaction) -> None:
@@ -446,7 +459,9 @@ class EditModal(discord.ui.Modal, title="Edit metadata"):
             label="Album (empty = single)", default=meta.album or "", max_length=200, required=False
         )
         self.year_input = discord.ui.TextInput(label="Year", default=str(meta.year or ""), max_length=4, required=False)
-        self.genre_input = discord.ui.TextInput(label="Genre", default=meta.genre or "", max_length=100, required=False)
+        self.genre_input = discord.ui.TextInput(
+            label="Genres (comma-separated)", default=", ".join(meta.genres), max_length=200, required=False
+        )
         for item in (self.title_input, self.artist_input, self.album_input, self.year_input, self.genre_input):
             self.add_item(item)
 
@@ -454,14 +469,19 @@ class EditModal(discord.ui.Modal, title="Edit metadata"):
         entry = self.entry
         current = entry.require_meta()
         year_text = self.year_input.value.strip()
+        title = self.title_input.value.strip()
+        artist = self.artist_input.value.strip()
+        album = self.album_input.value.strip() or None
+        # The album artist belongs to the album and artist that were looked up; it is only dropped once those change.
+        unchanged = artist == current.artist and album == current.album
         entry.meta = replace(
             current,
-            title=self.title_input.value.strip(),
-            artist=self.artist_input.value.strip(),
-            album=self.album_input.value.strip() or None,
-            album_artist=None,
+            title=title,
+            artist=artist,
+            album=album,
+            album_artist=current.album_artist if unchanged else None,
             year=int(year_text) if year_text.isdigit() else None,
-            genre=self.genre_input.value.strip() or None,
+            genres=[genre.strip() for genre in re.split(r"[;,]", self.genre_input.value) if genre.strip()],
             origin=current.origin if current.origin.endswith("+edited") else f"{current.origin}+edited",
         )
         entry.edited = True
@@ -478,10 +498,11 @@ def build_review_view(bot: "MusicBot", entry: QueueEntry, note: str | None = Non
         f"### {discord.utils.escape_markdown(meta.title)}",
         _field("Artist", meta.artist),
         _field("Album", meta.album or f"{meta.title} (single)"),
-        _field("Year", meta.year),
-        _field("Genre", meta.genre),
-        _field("BPM", meta.bpm),
-        _field("Key", meta.key),
+        _field("Date" if meta.release.release_date else "Year", meta.release.release_date or meta.year),
+        _field("Genre", ", ".join(meta.genres)),
+        _field("Track", _track_position(meta)),
+        _field("BPM", meta.audio.bpm if meta.audio else None),
+        _field("Key", meta.audio.key if meta.audio else None),
         f"-# source: {meta.origin} · confidence {meta.confidence:.0%}"
         + (" · MusicBrainz match" if meta.musicbrainz else "")
         + f" · queue id `{entry.id}`",

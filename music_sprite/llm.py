@@ -81,7 +81,7 @@ class LlmClient:
             album=parsed.get("album"),
             album_artist=parsed.get("album_artist"),
             year=parsed.get("year") if isinstance(parsed.get("year"), int) else draft.year,
-            genre=parsed.get("genre") or draft.genre,
+            genres=[parsed["genre"]] if parsed.get("genre") else draft.genres,
             confidence=min(max(float(parsed.get("confidence", 0.0)), 0.0), 1.0),
             origin=f"llm:{self._config.llm_model}",
         )

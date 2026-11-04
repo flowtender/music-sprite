@@ -5,7 +5,7 @@ from pathlib import Path
 
 from . import heuristics
 from .acoustid import AcoustIdClient
-from .analysis import AnalysisError, Analyzer
+from .analysis import AnalysisError, Analyzer, describe, guessed_genres
 from .config import Config
 from .llm import LlmClient
 from .models import LookupUnavailable, TrackMetadata
@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 
 TRUSTED_SOURCE_CONFIDENCE = 0.9
 MAX_LISTED_RELEASES = 3
+MAX_LISTED_CREDITS = 3
 
 # Called with the finished steps so far and what is running right now (None between steps).
 ProgressCallback = Callable[[list[str], str | None], Awaitable[None]]
@@ -60,16 +61,45 @@ def _describe(meta: TrackMetadata) -> str:
 
 def _detail(meta: TrackMetadata) -> str:
     """Everything known about a track on one line, for the lookup log."""
+    release = meta.release
     parts = [_describe(meta)]
     if meta.album:
         parts.append(f"album {meta.album}")
-    if meta.year:
-        parts.append(str(meta.year))
-    if meta.genre:
-        parts.append(f"genre {meta.genre}")
+    if release.release_date or meta.year:
+        parts.append(release.release_date or str(meta.year))
+    if release.track_number:
+        position = f"track {release.track_number}" + (f"/{release.track_total}" if release.track_total else "")
+        if release.disc_total and release.disc_total > 1:
+            position += f" (disc {release.disc_number}/{release.disc_total})"
+        parts.append(position)
+    if release.label:
+        parts.append(release.label + (f" {release.catalog_number}" if release.catalog_number else ""))
+    if meta.genres:
+        parts.append("genre " + ", ".join(meta.genres))
     length = meta.musicbrainz.length_seconds if meta.musicbrainz else None
     if length:
         parts.append(f"{int(length // 60)}:{int(length % 60):02d}")
+    return " · ".join(parts)
+
+
+def _release_facts(meta: TrackMetadata) -> str:
+    release = meta.release
+    facts = ["/".join(release.types), release.status, release.country, release.media_format]
+    facts = [fact for fact in facts if fact]
+    if release.barcode:
+        facts.append(f"barcode {release.barcode}")
+    if release.isrcs:
+        facts.append("ISRC " + ", ".join(release.isrcs[:2]))
+    if release.language:
+        facts.append(f"language {release.language}")
+    return " · ".join(facts)
+
+
+def _credit_summary(meta: TrackMetadata) -> str:
+    parts = []
+    for role, names in meta.release.credits.items():
+        hidden = len(names) - MAX_LISTED_CREDITS
+        parts.append(f"{role} {', '.join(names[:MAX_LISTED_CREDITS])}" + (f" +{hidden} more" if hidden > 0 else ""))
     return " · ".join(parts)
 
 
@@ -115,9 +145,9 @@ class MetadataResolver:
         if reason:
             await steps.add(f"Analysis: skipped ({reason})")
             return
-        await steps.working("Analyzing the audio for tempo, key and genre")
+        await steps.working("Analyzing the audio (tempo, key, genre, mood, loudness)")
         try:
-            analysis = await self._analyzer.analyze(audio_path)
+            features = await self._analyzer.analyze(audio_path)
         except AnalysisError as error:
             await steps.add(f"Analysis: failed ({error})")
             return
@@ -125,10 +155,11 @@ class MetadataResolver:
             log.exception("audio analysis crashed for %s", audio_path)
             await steps.add("Analysis: crashed; see the service log")
             return
-        await steps.add(f"Analysis: {analysis.describe()}")
+        for line in describe(features):
+            await steps.add(f"Analysis: {line}")
 
         def with_analysis(meta: TrackMetadata) -> TrackMetadata:
-            return replace(meta, bpm=analysis.bpm, key=analysis.key, genre=meta.genre or analysis.genre)
+            return replace(meta, audio=features, genres=meta.genres or guessed_genres(features))
 
         resolution.metadata = with_analysis(resolution.metadata)
         resolution.candidates = [with_analysis(candidate) for candidate in resolution.candidates]
@@ -247,6 +278,9 @@ class MetadataResolver:
         suffix = f" ({score})" if score else ""
         if len(matches) == 1:
             await steps.add(f"{source}: matched {_detail(matches[0])}{suffix}")
+            for label, text in (("release", _release_facts(matches[0])), ("credits", _credit_summary(matches[0]))):
+                if text:
+                    await steps.add(f"MusicBrainz {label}: {text}")
             return
         listed = " / ".join(_release_label(match) for match in matches[:MAX_LISTED_RELEASES])
         hidden = len(matches) - MAX_LISTED_RELEASES
@@ -258,4 +292,4 @@ class MetadataResolver:
 
     @staticmethod
     def _keep_source_genre(matched: TrackMetadata, earlier: TrackMetadata) -> TrackMetadata:
-        return replace(matched, genre=matched.genre or earlier.genre)
+        return replace(matched, genres=matched.genres or earlier.genres)

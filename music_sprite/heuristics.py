@@ -39,7 +39,7 @@ def guess(info: dict, known_publishers: frozenset[str]) -> TrackMetadata:
     publisher = is_known_publisher(channel, known_publishers)
     shared = dict(
         year=_year(info),
-        genre=info.get("genre"),
+        genres=[info["genre"]] if info.get("genre") else [],
         from_known_publisher=publisher,
     )
 

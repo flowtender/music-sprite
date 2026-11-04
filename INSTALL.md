@@ -13,7 +13,7 @@ sudo venv/bin/pip install .
 
 Optional but recommended, for audio fingerprint matching: install `fpcalc` (Arch: `chromaprint`, Debian/Ubuntu: `libchromaprint-tools`) and set `ACOUSTID_API_KEY` in step 4.
 
-Optional, to tag tempo (BPM), musical key and a genre guess from the audio itself: install the `analysis` extra instead (about 300 MB, TensorFlow included) and make sure `ffmpeg` is on the server. The ~20 MB of models download themselves on first use, into `ANALYSIS_MODEL_DIR`.
+Optional, to tag what the audio itself reveals (tempo, key, genre guesses, moods, instruments, vocals, danceability, and loudness as ReplayGain): install the `analysis` extra instead (about 300 MB, TensorFlow included) and make sure `ffmpeg` is on the server. The ~35 MB of models download themselves on first use, into `ANALYSIS_MODEL_DIR`.
 ```bash
 sudo venv/bin/pip install '.[analysis]'
 ```
