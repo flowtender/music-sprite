@@ -4,3 +4,4 @@ __pycache__/
 venv/
 music-sprite.env
 .claude/settings.local.json
+build/
