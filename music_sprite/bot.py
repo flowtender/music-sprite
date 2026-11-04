@@ -27,6 +27,8 @@ QUEUE_VIEW_TIMEOUT_SECONDS = 900
 QUEUE_PAGE_SIZE = 25
 MAX_REVIEWS_AT_ONCE = 10
 STATUS_EDIT_INTERVAL_SECONDS = 2.0
+# Webhook errors Discord returns once an interaction token (valid for 15 minutes) is no longer usable.
+INTERACTION_EXPIRED_CODES = frozenset({10015, 50027})
 ACCENT_BY_CONFIDENCE = ((0.85, discord.Colour.green()), (0.5, discord.Colour.gold()))
 STATUS_ICON = {"resolved": "✅", "partial": "⚠️", "pending": "⏳"}
 EDITED_ICON = "✏️"
@@ -65,15 +67,22 @@ def entry_icon(entry: QueueEntry) -> str:
 
 
 class ThrottledStatus:
-    def __init__(self, message: discord.PartialMessage):
-        self._message = message
+    def __init__(self, interaction: discord.Interaction):
+        self._interaction = interaction
         self._last_edit = 0.0
+        self._expired = False
 
     async def show(self, text: str, force: bool = False) -> None:
         now = time.monotonic()
-        if force or now - self._last_edit >= STATUS_EDIT_INTERVAL_SECONDS:
-            self._last_edit = now
-            await self._message.edit(view=status_view(text))
+        if self._expired or not (force or now - self._last_edit >= STATUS_EDIT_INTERVAL_SECONDS):
+            return
+        self._last_edit = now
+        try:
+            await self._interaction.edit_original_response(view=status_view(text))
+        except discord.HTTPException as error:
+            if error.code not in INTERACTION_EXPIRED_CODES:
+                raise
+            self._expired = True
 
 
 class EditModal(discord.ui.Modal, title="Edit metadata"):
@@ -112,11 +121,11 @@ class EditModal(discord.ui.Modal, title="Edit metadata"):
 
 
 class ReviewView(discord.ui.LayoutView):
-    def __init__(self, bot: "MusicBot", entry: QueueEntry):
+    def __init__(self, bot: "MusicBot", entry: QueueEntry, note: str | None = None):
         super().__init__(timeout=REVIEW_TIMEOUT_SECONDS)
         self.bot = bot
         self.entry = entry
-        self.message: discord.Message | None = None
+        self.note = note
         if entry.meta is None:
             entry.meta = heuristics.guess(entry.info, bot.config.known_publishers)
 
@@ -146,6 +155,8 @@ class ReviewView(discord.ui.LayoutView):
         lines.extend(f"-# {step}" for step in self.entry.resolve_steps)
         if self.entry.resolve_error:
             lines.append(f"-# ⚠️ {self.entry.resolve_error}")
+        if self.note:
+            lines.append(f"-# {self.note}")
         details = discord.ui.TextDisplay("\n".join(lines))
         thumbnail_url = self.entry.info.get("thumbnail")
         body = (
@@ -179,17 +190,14 @@ class ReviewView(discord.ui.LayoutView):
         self.stop()
         await interaction.response.edit_message(view=status_view(f"Closed. `{self.entry.id}` is still in the queue."))
 
-    async def on_timeout(self) -> None:
-        if self.message:
-            await self.message.edit(view=status_view(f"Review timed out. `{self.entry.id}` is still in the queue."))
-
 
 class QueueView(discord.ui.LayoutView):
-    def __init__(self, bot: "MusicBot"):
+    def __init__(self, bot: "MusicBot", note: str | None = None):
         super().__init__(timeout=QUEUE_VIEW_TIMEOUT_SECONDS)
         self.bot = bot
+        self.note = note
         self.page = 0
-        self.selected: set[str] = set()
+        self.selected: set[str] = {entry.id for entry in bot.staging.list()[:1]}
         self.render()
 
     def render(self) -> None:
@@ -244,7 +252,7 @@ class QueueView(discord.ui.LayoutView):
 
         self.add_item(
             discord.ui.Container(
-                discord.ui.TextDisplay("\n".join([header, *lines, legend])),
+                discord.ui.TextDisplay("\n".join([*([f"-# {self.note}"] if self.note else []), header, *lines, legend])),
                 discord.ui.ActionRow(select),
                 discord.ui.ActionRow(*buttons),
             )
@@ -267,10 +275,10 @@ class QueueView(discord.ui.LayoutView):
         if not entries:
             await interaction.response.send_message("Select tracks first.", ephemeral=True)
             return
-        await interaction.response.send_message(f"Opening {len(entries)} review(s) below.", ephemeral=True)
-        for entry in entries:
-            review = ReviewView(self.bot, entry)
-            review.message = await interaction.channel.send(view=review)
+        reviews = [ReviewView(self.bot, entry) for entry in entries]
+        await interaction.response.send_message(view=reviews[0], ephemeral=True)
+        for review in reviews[1:]:
+            await interaction.followup.send(view=review, ephemeral=True)
 
     async def _lookup(self, interaction: discord.Interaction):
         entries = self._selected_entries()
@@ -314,13 +322,13 @@ class QueueCommands(app_commands.Group):
 
     @app_commands.command(name="list", description="Show downloaded tracks; select some to review, look up or discard")
     async def list_queue(self, interaction: discord.Interaction):
-        await interaction.response.send_message(view=QueueView(self.bot))
+        await interaction.response.send_message(view=QueueView(self.bot), ephemeral=True)
 
     @app_commands.command(name="lookup", description="Retry metadata lookup for tracks that are pending or incomplete")
     async def lookup(self, interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
         count = await self.bot.resolve_unfinished()
-        await interaction.followup.send(f"Looked up {count} track(s). Use `/queue list` to review them.")
+        await interaction.followup.send(f"Looked up {count} track(s). Use `{self.bot.queue_list_command}` to review them.")
 
 
 class MusicBot(discord.Client):
@@ -359,11 +367,18 @@ class MusicBot(discord.Client):
         # Always sync the global set, even when empty, so turning the toggle off removes previously registered commands.
         await self.tree.sync()
 
+    @property
+    def queue_list_command(self) -> str:
+        return f"/{self.config.command_name} queue list"
+
     def _register_commands(self, guild: discord.Object | None, contexts: app_commands.AppCommandContext | None) -> None:
-        for command in (QueueCommands(self), make_download_command()):
-            if contexts is not None:
-                command.allowed_contexts = contexts
-            self.tree.add_command(command, guild=guild)
+        # One group per registration (a command can only have one parent) so the guild and global copies can differ.
+        root = app_commands.Group(name=self.config.command_name, description="Download music and manage the import queue")
+        for command in (QueueCommands(self), make_download_command(), make_clean_command()):
+            root.add_command(command)
+        if contexts is not None:
+            root.allowed_contexts = contexts
+        self.tree.add_command(root, guild=guild)
 
     async def close(self) -> None:
         await super().close()
@@ -378,6 +393,17 @@ class MusicBot(discord.Client):
         await interaction.response.send_message("You are not allowed to use this bot.", ephemeral=True)
         return False
 
+    async def clean_dm(self, interaction: discord.Interaction) -> None:
+        assert self.user is not None
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        dm = await interaction.user.create_dm()
+        deleted = 0
+        async for message in dm.history(limit=None):
+            if message.author.id == self.user.id:
+                await message.delete()
+                deleted += 1
+        await interaction.followup.send(f"Deleted {deleted} of my messages from this DM.")
+
     async def start_download(self, interaction: discord.Interaction, url: str, options: str) -> None:
         url = url.strip()
         try:
@@ -388,36 +414,33 @@ class MusicBot(discord.Client):
             await interaction.response.send_message(f"Rejected: {error}", ephemeral=True)
             return
 
-        await interaction.response.send_message(view=status_view("Downloading…"))
-        original = await interaction.original_response()
-        # Interaction tokens expire after 15 minutes but downloads can run for hours, so edit with the bot token.
-        assert interaction.channel_id is not None
-        channel = self.get_partial_messageable(interaction.channel_id, guild_id=interaction.guild_id)
-        await self._run_download(channel.get_partial_message(original.id), url, extra_args, interaction.user.id)
+        await interaction.response.send_message(view=status_view("Downloading…"), ephemeral=True)
+        await self._run_download(interaction, url, extra_args)
 
-    async def _run_download(self, reply: discord.PartialMessage, url: str, extra_args: list[str], user_id: int) -> None:
-        status = ThrottledStatus(reply)
+    async def _run_download(self, interaction: discord.Interaction, url: str, extra_args: list[str]) -> None:
+        status = ThrottledStatus(interaction)
         batch_id = uuid.uuid4().hex[:8]
         incoming = self.staging.incoming_dir(batch_id)
         entries: list[QueueEntry] = []
 
         async def adopt(track: DownloadedTrack) -> None:
-            entries.append(self.staging.adopt(track, url, user_id, batch_id))
+            entries.append(self.staging.adopt(track, url, interaction.user.id, batch_id))
             await status.show(f"Downloaded {len(entries)} track(s)…")
 
         try:
             async with self._download_slots:
                 failed_items = await download(url, extra_args, incoming, self.config.max_playlist_items, adopt)
         except DownloadError as error:
-            await reply.edit(view=status_view(f"Download failed:\n```\n{_truncate(str(error), 1500)}\n```"))
+            await self._finish(interaction, f"Download failed:\n```\n{_truncate(str(error), 1500)}\n```")
             return
         except Exception:
             log.exception("download failed for %s", url)
-            await reply.edit(view=status_view("Download failed unexpectedly; see the service log."))
+            await self._finish(interaction, "Download failed unexpectedly; see the service log.")
             return
         finally:
             shutil.rmtree(incoming, ignore_errors=True)
 
+        view: discord.ui.LayoutView | None = None
         try:
             imported = 0
             for position, entry in enumerate(entries, start=1):
@@ -425,11 +448,29 @@ class MusicBot(discord.Client):
                 await self.resolve_entry(entry)
                 if self._qualifies_for_auto_import(entry):
                     imported += "Added" in await self.import_entry(entry)
-            summary = self._batch_summary(entries, imported, len(failed_items))
+            waiting = [entry for entry in entries if self.staging.get(entry.id)]
+            summary = self._batch_summary(entries, waiting, imported, len(failed_items))
+            if len(waiting) == 1:
+                view = ReviewView(self, waiting[0], note=summary)
+            elif waiting:
+                view = QueueView(self, note=summary)
+            text = f"{summary} Use `{self.queue_list_command}` to review." if waiting else summary
         except Exception:
             log.exception("lookup stage failed for %s", url)
-            summary = f"Queued {len(entries)} track(s), but metadata lookup crashed; see the service log."
-        await reply.edit(view=status_view(summary))
+            text = f"Queued {len(entries)} track(s), but metadata lookup crashed; see the service log."
+        await self._finish(interaction, text, view)
+
+    async def _finish(self, interaction: discord.Interaction, text: str, view: discord.ui.LayoutView | None = None) -> None:
+        try:
+            await interaction.edit_original_response(view=view if view is not None else status_view(text))
+        except discord.HTTPException as error:
+            if error.code not in INTERACTION_EXPIRED_CODES:
+                raise
+            # Long downloads outlive the interaction token, so fall back to a DM with the plain-text result.
+            try:
+                await interaction.user.send(text)
+            except discord.HTTPException as dm_error:
+                log.warning("could not deliver the finished download to user %s: %s", interaction.user.id, dm_error)
 
     def _qualifies_for_auto_import(self, entry: QueueEntry) -> bool:
         threshold = self.config.auto_import_confidence
@@ -441,8 +482,7 @@ class MusicBot(discord.Client):
             and entry.meta.confidence >= threshold
         )
 
-    def _batch_summary(self, entries: list[QueueEntry], imported: int, failed_items: int) -> str:
-        waiting = [entry for entry in entries if self.staging.get(entry.id)]
+    def _batch_summary(self, entries: list[QueueEntry], waiting: list[QueueEntry], imported: int, failed_items: int) -> str:
         incomplete = sum(entry.status != "resolved" for entry in waiting)
         parts = [f"Downloaded {len(entries)} track(s)."]
         if imported:
@@ -451,8 +491,6 @@ class MusicBot(discord.Client):
             parts.append(f"{len(waiting)} waiting in the queue ({incomplete} with incomplete lookup).")
         if failed_items:
             parts.append(f"{failed_items} item(s) failed to download.")
-        if waiting:
-            parts.append("Use `/queue list` to review.")
         return " ".join(parts)
 
     async def resolve_entry(self, entry: QueueEntry, overwrite_edits: bool = False) -> None:
@@ -513,4 +551,19 @@ def make_download_command() -> app_commands.Command:
     # A fresh instance per registration: contexts differ between the guild and global copies.
     return app_commands.Command(
         name="download", description="Download a track or playlist into the queue", callback=_download_callback
+    )
+
+
+async def _clean_callback(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    assert isinstance(bot, MusicBot)
+    if await bot.ensure_allowed(interaction):
+        await bot.clean_dm(interaction)
+
+
+def make_clean_command() -> app_commands.Command:
+    return app_commands.Command(
+        name="clean",
+        description="Delete the bot's old messages in your DM with it",
+        callback=_clean_callback,
     )

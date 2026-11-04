@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +31,7 @@ class Config:
     discord_token: str
     guild_id: int | None
     global_commands: bool
+    command_name: str
     allowed_user_ids: frozenset[int]
 
     music_root: Path
@@ -61,6 +63,11 @@ class Config:
         state_dir = Path(os.environ.get("STATE_DIRECTORY", "/var/lib/music-sprite"))
         guild_id = int(os.environ.get("DISCORD_GUILD_ID") or 0) or None
         global_commands = _flag("DISCORD_GLOBAL_COMMANDS", True)
+        command_name = os.environ.get("DISCORD_COMMAND_NAME", "").strip() or "music_sprite"
+        if command_name != command_name.lower() or not re.fullmatch(r"[\w-]{1,32}", command_name):
+            raise ValueError(
+                f"DISCORD_COMMAND_NAME must be 1-32 lowercase letters, digits, '-' or '_', got {command_name!r}"
+            )
         if guild_id is None and not global_commands:
             raise ValueError("Set DISCORD_GUILD_ID or enable DISCORD_GLOBAL_COMMANDS; otherwise no commands would be registered")
         auto_import = os.environ.get("AUTO_IMPORT_CONFIDENCE", "")
@@ -71,6 +78,7 @@ class Config:
             discord_token=os.environ["DISCORD_TOKEN"],
             guild_id=guild_id,
             global_commands=global_commands,
+            command_name=command_name,
             allowed_user_ids=_id_set("DISCORD_ALLOWED_USER_IDS"),
             music_root=Path(os.environ.get("MUSIC_ROOT", "/srv/music")),
             library_path_template=template,
