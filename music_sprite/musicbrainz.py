@@ -1,8 +1,9 @@
+"""Fetches what MusicBrainz knows about a recording that AcoustID identified, and the release it is on."""
+
 import asyncio
 import logging
 import time
 from dataclasses import replace
-from difflib import SequenceMatcher
 
 import httpx
 
@@ -17,9 +18,6 @@ RELEASE_URL = f"{API_ROOT}/release"
 # release request adds the track position, label, catalog number, barcode, album artist and release-group genres.
 RECORDING_INC = "artists+artist-credits+releases+release-groups+isrcs+genres+work-rels+work-level-rels+artist-rels"
 RELEASE_INC = "artist-credits+labels+recordings+release-groups+genres"
-MIN_SEARCH_SCORE = 90
-MIN_TEXT_SIMILARITY = 0.85
-DURATION_TOLERANCE_SECONDS = 15
 REQUEST_SPACING_SECONDS = 1.1
 CACHE_SECONDS = 600
 CACHE_ENTRIES = 64
@@ -50,14 +48,6 @@ WORK_ROLES = {
     "arranger": "arranger",
     "orchestrator": "arranger",
 }
-
-
-def _similarity(left: str, right: str) -> float:
-    return SequenceMatcher(None, left.casefold(), right.casefold()).ratio()
-
-
-def _escape(term: str) -> str:
-    return term.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _credited(credits: list[dict], *, sort: bool = False) -> str:
@@ -139,36 +129,16 @@ class MusicBrainzClient:
         self._lock = asyncio.Lock()
         self._cache: dict[tuple, tuple[float, dict]] = {}
 
-    async def enrich(self, draft: TrackMetadata, duration_seconds: float | None) -> list[TrackMetadata]:
-        """Returns every recording that matches at the best search score, with full details."""
-        if not draft.artist or not draft.title:
-            return []
-        query = f'recording:"{_escape(draft.title)}" AND artist:"{_escape(draft.artist)}"'
-        matching = [
-            recording
-            for recording in await self._search(query)
-            if self._matches(recording, draft, duration_seconds)
-        ]
-        if not matching:
-            return []
-        best_score = max(recording["score"] for recording in matching)
-        tied = [recording for recording in matching if recording["score"] == best_score]
-        return [await self.fetch_recording(recording["id"], draft, best_score / 100, "musicbrainz") for recording in tied]
-
     async def fetch_recording(
         self, recording_id: str, draft: TrackMetadata, confidence: float, origin: str
     ) -> TrackMetadata:
-        recording = await self._get_cached(f"{RECORDING_URL}/{recording_id}", {"inc": RECORDING_INC})
+        recording = await self._get(f"{RECORDING_URL}/{recording_id}", {"inc": RECORDING_INC})
         stub = self._pick_release(recording.get("releases") or [])
-        release = await self._get_cached(f"{RELEASE_URL}/{stub['id']}", {"inc": RELEASE_INC}) if stub else {}
+        release = await self._get(f"{RELEASE_URL}/{stub['id']}", {"inc": RELEASE_INC}) if stub else {}
         return self._merge(draft, recording, release, confidence, origin)
 
-    async def _search(self, query: str) -> list[dict]:
-        return (await self._get(RECORDING_URL, {"query": query, "limit": 5})).get("recordings", [])
-
-    async def _get_cached(self, url: str, params: dict) -> dict:
-        """Recordings and releases are fetched by id, and the AcoustID and text-search paths run side by side, so
-        both often want the same ones."""
+    async def _get(self, url: str, params: dict) -> dict:
+        """AcoustID often matches several recordings on the same releases, so the same release is wanted again."""
         key = (url, tuple(sorted(params.items())))
         async with self._lock:
             found = self._cache.get(key)
@@ -179,10 +149,6 @@ class MusicBrainzClient:
             while len(self._cache) > CACHE_ENTRIES:
                 del self._cache[next(iter(self._cache))]
             return data
-
-    async def _get(self, url: str, params: dict) -> dict:
-        async with self._lock:
-            return await self._request(url, params)
 
     async def _request(self, url: str, params: dict) -> dict:
         """One rate-limited request; the caller holds the lock."""
@@ -200,18 +166,6 @@ class MusicBrainzClient:
             raise LookupUnavailable("musicbrainz") from error
         finally:
             await asyncio.sleep(REQUEST_SPACING_SECONDS)
-
-    def _matches(self, recording: dict, draft: TrackMetadata, duration_seconds: float | None) -> bool:
-        if recording.get("score", 0) < MIN_SEARCH_SCORE:
-            return False
-        if _similarity(recording.get("title", ""), draft.title) < MIN_TEXT_SIMILARITY:
-            return False
-        if _similarity(_credited(recording.get("artist-credit", [])), draft.artist) < MIN_TEXT_SIMILARITY:
-            return False
-        length_ms = recording.get("length")
-        if length_ms and duration_seconds:
-            return abs(length_ms / 1000 - duration_seconds) <= DURATION_TOLERANCE_SECONDS
-        return True
 
     @staticmethod
     def _pick_release(releases: list[dict]) -> dict:

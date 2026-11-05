@@ -1,3 +1,5 @@
+"""Moves a tagged track into the music library and tells Navidrome to rescan."""
+
 import hashlib
 import logging
 import secrets
@@ -6,7 +8,7 @@ from pathlib import Path
 
 import httpx
 
-from .config import Config
+from .config import LibraryConfig
 from .layout import render_relative_path, safe_name
 from .models import TrackMetadata
 from .staging import QueueEntry
@@ -15,8 +17,8 @@ from .tagger import source_fields, write_tags
 log = logging.getLogger(__name__)
 
 
-def destination_for(audio_path: Path, meta: TrackMetadata, config: Config) -> Path:
-    relative = render_relative_path(config.library_path_template, meta)
+def destination_for(audio_path: Path, meta: TrackMetadata, config: LibraryConfig) -> Path:
+    relative = render_relative_path(config.path_template, meta)
     folder = config.music_root / relative.parent
     target = folder / f"{relative.name}{audio_path.suffix}"
     counter = 2
@@ -26,7 +28,7 @@ def destination_for(audio_path: Path, meta: TrackMetadata, config: Config) -> Pa
     return target
 
 
-def add_to_library(config: Config, entry: QueueEntry, meta: TrackMetadata) -> Path:
+def add_to_library(config: LibraryConfig, entry: QueueEntry, meta: TrackMetadata) -> Path:
     write_tags(entry.audio_path, meta, source_fields(entry.info, meta), entry.cover_path)
     _archive_source_metadata(config, entry)
     target = destination_for(entry.audio_path, meta, config)
@@ -36,7 +38,7 @@ def add_to_library(config: Config, entry: QueueEntry, meta: TrackMetadata) -> Pa
     return target
 
 
-def _archive_source_metadata(config: Config, entry: QueueEntry) -> None:
+def _archive_source_metadata(config: LibraryConfig, entry: QueueEntry) -> None:
     extractor = safe_name(entry.info.get("extractor_key") or "unknown")
     name = safe_name(entry.info.get("id") or entry.audio_path.stem)
     destination = config.archive_dir / extractor / f"{name}.info.json"
@@ -44,7 +46,7 @@ def _archive_source_metadata(config: Config, entry: QueueEntry) -> None:
     shutil.copyfile(entry.info_path, destination)
 
 
-async def trigger_navidrome_scan(http: httpx.AsyncClient, config: Config) -> None:
+async def trigger_navidrome_scan(http: httpx.AsyncClient, config: LibraryConfig) -> None:
     if not config.navidrome_url:
         return
     salt = secrets.token_hex(6)

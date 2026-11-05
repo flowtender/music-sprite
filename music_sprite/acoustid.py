@@ -1,3 +1,5 @@
+"""Identifies a recording from its audio fingerprint (fpcalc + the AcoustID web service)."""
+
 import asyncio
 import json
 import logging
@@ -7,7 +9,6 @@ from pathlib import Path
 
 import httpx
 
-from .config import Config
 from .models import LookupUnavailable
 
 log = logging.getLogger(__name__)
@@ -27,13 +28,13 @@ class AcoustIdMatch:
 
 
 class AcoustIdClient:
-    def __init__(self, http: httpx.AsyncClient, config: Config):
+    def __init__(self, http: httpx.AsyncClient, api_key: str):
         self._http = http
-        self._config = config
+        self._api_key = api_key
 
     @property
     def disabled_reason(self) -> str | None:
-        if not self._config.acoustid_api_key:
+        if not self._api_key:
             return "ACOUSTID_API_KEY not set"
         if shutil.which("fpcalc") is None:
             return "fpcalc not installed (chromaprint package)"
@@ -45,7 +46,7 @@ class AcoustIdClient:
             response = await self._http.post(
                 API_URL,
                 data={
-                    "client": self._config.acoustid_api_key,
+                    "client": self._api_key,
                     "meta": "recordings",
                     "duration": str(round(duration)),
                     "fingerprint": fingerprint,

@@ -1,3 +1,5 @@
+"""Writes TrackMetadata into the audio file's own tags (Vorbis comments, ID3 or MP4 atoms)."""
+
 import base64
 import json
 from pathlib import Path
@@ -11,13 +13,10 @@ from mutagen.mp4 import MP4, AtomDataType, MP4Cover, MP4FreeForm
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 
+from .downloader import portable_info
 from .models import REPLAYGAIN_REFERENCE_LUFS, TrackMetadata
 
 MAX_COMMENT_CHARS = 4000
-BULKY_INFO_KEYS = frozenset({
-    "formats", "requested_formats", "requested_downloads", "thumbnails", "http_headers",
-    "automatic_captions", "subtitles", "requested_subtitles", "heatmap", "url", "manifest_url",
-})
 
 # Every tag is first built under its Vorbis comment name (see _fields) and translated from there. These names have a
 # native frame or atom in some formats; the rest are written as custom text frames (ID3) or free-form atoms (MP4).
@@ -66,28 +65,13 @@ def source_fields(info: dict, meta: TrackMetadata) -> dict[str, str]:
         "source_playlist": info.get("playlist_title"),
         "description": (info.get("description") or "")[:MAX_COMMENT_CHARS],
         "metadata_origin": meta.origin,
-        "source_metadata": json.dumps(_portable_info(info), ensure_ascii=False, default=str),
+        "source_metadata": json.dumps(portable_info(info), ensure_ascii=False, default=str),
     }
     return {key: str(value) for key, value in fields.items() if value}
 
 
-def _portable_info(info: dict) -> dict:
-    return {
-        key: value
-        for key, value in info.items()
-        if key not in BULKY_INFO_KEYS and not key.startswith("_")
-    }
-
-
 def write_tags(path: Path, meta: TrackMetadata, source: dict[str, str], cover_path: Path | None) -> None:
-    writer = {
-        ".opus": _write_ogg(OggOpus, opus=True),
-        ".ogg": _write_ogg(OggVorbis, opus=False),
-        ".flac": _write_flac,
-        ".mp3": _write_mp3,
-        ".m4a": _write_mp4,
-        ".mp4": _write_mp4,
-    }.get(path.suffix.lower())
+    writer = WRITERS.get(path.suffix.lower())
     if writer is None:
         raise UnsupportedFormat(f"cannot tag {path.suffix} files")
     cover = cover_path.read_bytes() if cover_path else None
@@ -287,3 +271,13 @@ def _write_mp4(path: Path, meta: TrackMetadata, source: dict[str, str], cover: b
     if cover:
         audio["covr"] = [MP4Cover(cover, imageformat=MP4Cover.FORMAT_JPEG)]
     audio.save()
+
+
+WRITERS = {
+    ".opus": _write_ogg(OggOpus, opus=True),
+    ".ogg": _write_ogg(OggVorbis, opus=False),
+    ".flac": _write_flac,
+    ".mp3": _write_mp3,
+    ".m4a": _write_mp4,
+    ".mp4": _write_mp4,
+}

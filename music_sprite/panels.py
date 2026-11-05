@@ -1,20 +1,32 @@
-"""Discord panels: the download queue and the per-track review card.
+"""The download queue list: every queued track with its lookup state, and buttons to review, look up or discard.
 
-Every interactive item is a DynamicItem whose custom_id carries the state it needs (queue entry id, page, ...), and
-everything else is read back from the message the click came from or from the queue on disk. Nothing lives in
-memory, so panels keep working after the bot restarts.
+Every interactive item is a DynamicItem whose custom_id carries the state it needs (page, entry id), and the rest is
+read back from the message the click came from (which tracks are selected, the note) or from the queue on disk.
+Nothing lives in memory, so the list keeps working after the bot restarts.
 """
 
 import math
 import re
-from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING
 
 import discord
-from discord.ui import ActionRow, Button, Container, DynamicItem, LayoutView, Section, Select, TextDisplay
+from discord.ui import ActionRow, Button, DynamicItem, LayoutView, Section, Select, TextDisplay
 
-from .resolver import ProgressCallback
-from .staging import QueueEntry
+from .staging import EntryStatus, QueueEntry
+from .ui import (
+    STYLE,
+    AllowedUsersOnly,
+    bot_of,
+    container_view,
+    edit_status_of,
+    entry_label,
+    escape,
+    look_up,
+    lookup_status,
+    status_view,
+    truncate,
+    unwrap,
+)
 
 if TYPE_CHECKING:
     from .bot import MusicBot
@@ -26,35 +38,9 @@ QUEUE_BUTTON_LIST_MAX = 10
 MAX_REVIEWS_AT_ONCE = 10
 NOTE_COMPONENT_ID = 7001
 
-ACCENT_BY_CONFIDENCE = ((0.85, discord.Colour.green()), (0.5, discord.Colour.gold()))
-STATUS_ICON = {"resolved": "✅", "partial": "⚠️", "pending": "⏳"}
+STATUS_ICON = {EntryStatus.RESOLVED: "✅", EntryStatus.PARTIAL: "⚠️", EntryStatus.PENDING: "⏳"}
 EDITED_ICON = "✏️"
 CHOICE_ICON = "❓"
-
-STYLE = discord.ButtonStyle
-
-
-def status_view(text: str) -> LayoutView:
-    view = LayoutView(timeout=None)
-    view.add_item(Container(TextDisplay(text)))
-    return view
-
-
-def truncate(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
-def accent(confidence: float) -> discord.Colour:
-    for threshold, colour in ACCENT_BY_CONFIDENCE:
-        if confidence >= threshold:
-            return colour
-    return discord.Colour.red()
-
-
-def entry_label(entry: QueueEntry) -> str:
-    if entry.meta and entry.meta.title:
-        return f"{entry.meta.artist or '?'} – {entry.meta.title}"
-    return entry.info.get("title") or entry.audio_file
 
 
 def entry_icon(entry: QueueEntry) -> str:
@@ -62,43 +48,7 @@ def entry_icon(entry: QueueEntry) -> str:
         return EDITED_ICON
     if entry.needs_choice:
         return CHOICE_ICON
-    return STATUS_ICON.get(entry.status, "⏳")
-
-
-STEP_MAX_CHARS = 300
-
-
-def lookup_status(entry: QueueEntry, position: int, total: int, steps: Sequence[str] = (), working: Sequence[str] = ()) -> str:
-    """The text shown while a track is being looked up: what each source found so far and what is running now."""
-    counter = f" {position}/{total}" if total > 1 else ""
-    lines = [f"**Looking up metadata{counter}** · {discord.utils.escape_markdown(entry_label(entry))}"]
-    lines.extend(f"-# {truncate(step, STEP_MAX_CHARS)}" for step in steps)
-    lines.extend(f"-# ⏳ {text}…" for text in working)
-    return "\n".join(lines)
-
-
-def lookup_progress(
-    entry: QueueEntry, position: int, total: int, display: Callable[[str], Awaitable[None]]
-) -> ProgressCallback:
-    async def update(steps: list[str], working: list[str]) -> None:
-        await display(lookup_status(entry, position, total, steps, working))
-
-    return update
-
-
-def edit_status_of(interaction: discord.Interaction) -> Callable[[str], Awaitable[None]]:
-    async def display(text: str) -> None:
-        await interaction.edit_original_response(view=status_view(text))
-
-    return display
-
-
-def bot_of(interaction: discord.Interaction) -> "MusicBot":
-    return interaction.client  # type: ignore[return-value]
-
-
-def unwrap(item):
-    return item.item if isinstance(item, DynamicItem) else item
+    return STATUS_ICON[entry.status]
 
 
 def _note_display(note: str) -> TextDisplay:
@@ -110,11 +60,6 @@ def _note_of(view: LayoutView) -> str | None:
         if isinstance(child, TextDisplay) and child.id == NOTE_COMPONENT_ID:
             return child.content.removeprefix("-# ")
     return None
-
-
-class AllowedUsersOnly:
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return await bot_of(interaction).ensure_allowed(interaction)
 
 
 # --- download queue -------------------------------------------------------------------------------------------
@@ -222,12 +167,7 @@ class QueueAction(AllowedUsersOnly, DynamicItem[Button], template=r"ms:q:(?P<act
         elif self.action == "lookup":
             # Lookups take several seconds each; swap the buttons for progress so nothing is clicked meanwhile.
             await interaction.response.edit_message(view=status_view(lookup_status(entries[0], 1, len(entries))))
-            display = edit_status_of(interaction)
-            for position, entry in enumerate(entries, start=1):
-                if position > 1:
-                    await display(lookup_status(entry, position, len(entries)))
-                progress = lookup_progress(entry, position, len(entries), display)
-                await bot.resolve_entry(entry, overwrite_edits=True, progress=progress)
+            await look_up(bot.pipeline, entries, edit_status_of(interaction), overwrite_edits=True)
             view = build_queue_view(bot, page=self.page, selected={entry.id for entry in entries}, note=note)
             await interaction.edit_original_response(view=view)
         else:
@@ -254,7 +194,7 @@ def build_queue_view(
     selected = {page_entries[0].id} if selected is None else selected & {entry.id for entry in page_entries}
 
     def row_text(entry: QueueEntry) -> str:
-        return f"{entry_icon(entry)} `{entry.id}` {discord.utils.escape_markdown(truncate(entry_label(entry), 70))}"
+        return f"{entry_icon(entry)} `{entry.id}` {escape(truncate(entry_label(entry), 70))}"
 
     header = f"### Download queue · {len(entries)} track(s)"
     legend = f"-# ✅ looked up · ⚠️ lookup incomplete · ⏳ not looked up · ✏️ edited by you · {CHOICE_ICON} several matches"
@@ -287,12 +227,6 @@ def build_queue_view(
             )
         )
     return container_view(children)
-
-
-def container_view(children: list, accent_colour: discord.Colour | None = None) -> LayoutView:
-    view = LayoutView(timeout=None)
-    view.add_item(Container(*children, accent_colour=accent_colour))
-    return view
 
 
 DYNAMIC_ITEMS = (QueueToggle, QueueSelect, QueueAction)

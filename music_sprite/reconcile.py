@@ -14,7 +14,6 @@ knows nothing about titles, and only MusicBrainz knows about releases. Fields ar
 import re
 from dataclasses import dataclass, replace
 
-from .analysis import guessed_genres
 from .models import Choices, Findings, TrackMetadata
 
 # A guess at artist and title from the upload alone is trusted without asking the LLM at this confidence.
@@ -84,16 +83,18 @@ def _group(pairs: list[tuple[str, object]]) -> list[Candidate]:
     return list(groups.values())
 
 
+def valid_index(value: object, count: int) -> bool:
+    """Whether a pick (the user's, the LLM's, or one read back from Discord) points at one of `count` releases."""
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < count
+
+
 def release_index(findings: Findings, choices: Choices) -> int | None:
     """The user's pick, else the LLM's (it only answers when releases tie), else the best-ranked match."""
     count = len(findings.releases)
     if not count:
         return None
     llm_pick = findings.llm.answers.get(RELEASE) if findings.llm else None
-    for pick in (choices.release, llm_pick):
-        if isinstance(pick, int) and not isinstance(pick, bool) and 0 <= pick < count:
-            return pick
-    return 0
+    return next((pick for pick in (choices.release, llm_pick) if valid_index(pick, count)), 0)
 
 
 def _pairs(name: str, selected: TrackMetadata | None, findings: Findings) -> list[tuple[str, object]]:
@@ -120,7 +121,7 @@ def _genres(selected: TrackMetadata | None, findings: Findings) -> list[str]:
     combined: dict[str, str] = {}
     sources = [
         selected.genres if selected else [],
-        guessed_genres(findings.audio) if findings.audio else [],
+        findings.audio.confident_genres if findings.audio else [],
         findings.upload.genres,
     ]
     for genres in sources:
@@ -193,9 +194,14 @@ def reconcile(findings: Findings, choices: Choices) -> Reconciled:
     return Reconciled(metadata, reports, findings.releases, index)
 
 
+def settled(findings: Findings) -> Reconciled:
+    """What the other sources settle on their own, before the LLM's answers and any choice by the user."""
+    return reconcile(replace(findings, llm=None), Choices())
+
+
 def ambiguous_fields(findings: Findings) -> list[str]:
     """The fields the sources cannot settle among themselves, for the LLM to answer. Its own answers are ignored."""
-    reconciled = reconcile(replace(findings, llm=None), Choices())
+    reconciled = settled(findings)
     asked = []
     for name in CHOOSABLE_FIELDS:
         candidates = reconciled.fields[name].candidates

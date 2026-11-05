@@ -1,3 +1,5 @@
+"""Runs yt-dlp, and knows what its info JSON holds."""
+
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -15,6 +17,11 @@ ALLOWED_SWITCH_FLAGS = frozenset({"--no-playlist", "--no-check-certificates"})
 
 DOWNLOAD_TIMEOUT_SECONDS = 2 * 60 * 60
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
+# Info JSON keys that are bulky and say nothing about the music: format lists, thumbnails, subtitles, ...
+BULKY_INFO_KEYS = frozenset({
+    "formats", "requested_formats", "requested_downloads", "thumbnails", "http_headers",
+    "automatic_captions", "subtitles", "requested_subtitles", "heatmap", "url", "manifest_url",
+})
 
 
 class RejectedArguments(ValueError):
@@ -48,6 +55,11 @@ def sanitize_extra_args(tokens: list[str]) -> list[str]:
             allowed = ", ".join(sorted(ALLOWED_VALUE_FLAGS | ALLOWED_SWITCH_FLAGS))
             raise RejectedArguments(f"`{token}` is not an allowed argument. Allowed: {allowed}")
     return sanitized
+
+
+def portable_info(info: dict, dropped: frozenset[str] = BULKY_INFO_KEYS) -> dict:
+    """The info JSON without the dropped keys and yt-dlp's private ones ("_filename", ...)."""
+    return {key: value for key, value in info.items() if key not in dropped and not key.startswith("_")}
 
 
 async def download(

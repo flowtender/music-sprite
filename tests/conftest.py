@@ -1,9 +1,15 @@
 import json
+import shutil
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
-from music_sprite.models import MusicBrainzIds, ReleaseInfo, TrackMetadata
+from music_sprite import library
+from music_sprite.config import LibraryConfig, LlmConfig, QueueConfig
+from music_sprite.models import Findings, MusicBrainzIds, ReleaseInfo, TrackMetadata
+from music_sprite.pipeline import Pipeline
+from music_sprite.resolver import Resolution
 from music_sprite.staging import QueueEntry, Staging
 
 
@@ -45,14 +51,60 @@ def upload(title="Low Tide", artist="Tidal Pools", confidence=0.9, **kwargs) -> 
     return TrackMetadata(title=title, artist=artist, confidence=confidence, origin="source-tags", **kwargs)
 
 
+def resolution(*, releases=1, unavailable=()) -> Resolution:
+    """What a lookup returns: the upload's own tags plus `releases` tied MusicBrainz matches."""
+    matches = [release(album=f"Album {i}", recording=f"r{i}") for i in range(releases)]
+    return Resolution(Findings(upload=upload(), releases=matches), list(unavailable), ["Upload: found"])
+
+
+def llm_config(**overrides) -> LlmConfig:
+    values = dict(
+        model="m", base_url="http://llm", api_key="", json_mode="schema", timeout_seconds=5, description_chars=100,
+        call_log=None,
+    )
+    return LlmConfig(**{**values, **overrides})
+
+
 @pytest.fixture
 def staging(tmp_path) -> Staging:
     return Staging(tmp_path)
 
 
 @pytest.fixture
-def bot(staging):
-    return SimpleNamespace(config=SimpleNamespace(known_publishers=frozenset()), staging=staging)
+def resolver():
+    """A metadata resolver whose answer each test sets on resolver.resolve."""
+    return SimpleNamespace(resolve=AsyncMock(return_value=resolution()))
+
+
+@pytest.fixture
+def make_pipeline(staging, resolver, tmp_path):
+    def make(auto_import_confidence=None) -> Pipeline:
+        queue = QueueConfig(
+            directory=staging.root, max_concurrent_downloads=1, max_playlist_items=10,
+            auto_import_confidence=auto_import_confidence,
+        )
+        library_config = LibraryConfig(
+            music_root=tmp_path / "music", path_template="{artist}/{title}", archive_dir=tmp_path / "archive",
+            navidrome_url="", navidrome_user="", navidrome_password="",
+        )
+        return Pipeline(queue, library_config, staging, resolver, http=None)
+
+    return make
+
+
+@pytest.fixture
+def imported(monkeypatch):
+    """Records library imports instead of tagging files; like the real one, an import empties the queue entry."""
+    calls = []
+
+    def add_to_library(config, entry, meta):
+        calls.append(entry.id)
+        shutil.rmtree(entry.directory)
+        return config.music_root / meta.artist / f"{meta.title}.opus"
+
+    monkeypatch.setattr(library, "add_to_library", add_to_library)
+    monkeypatch.setattr(library, "trigger_navidrome_scan", AsyncMock())
+    return calls
 
 
 @pytest.fixture

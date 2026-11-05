@@ -53,3 +53,10 @@ def test_a_new_lookup_discards_earlier_choices_and_hand_edits(make_entry):
     entry.choices.manual = {"year": 1999}
     entry.set_findings(Findings(upload=upload()))
     assert entry.choices.release is None and not entry.edited
+
+
+def test_an_entry_saved_before_its_first_lookup_can_be_listed(staging, make_entry):
+    entry = make_entry()
+    staging.save(entry)
+    assert [loaded.id for loaded in staging.list()] == [entry.id]
+    assert staging.get(entry.id).meta is None

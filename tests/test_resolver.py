@@ -3,7 +3,8 @@ import json
 from types import SimpleNamespace
 
 import httpx
-from conftest import release
+import pytest
+from conftest import llm_config, release
 
 from music_sprite.llm import LlmClient
 from music_sprite.models import AudioFeatures, Choices, LookupUnavailable
@@ -43,20 +44,13 @@ class FakeAcoustId:
 
 
 class FakeMusicBrainz:
-    def __init__(self, barrier=None, searched=None, fail=False):
-        self.barrier, self.searched, self.fail = barrier, searched or [], fail
+    def __init__(self, fail=False):
+        self.fail = fail
 
     async def fetch_recording(self, recording_id, draft, confidence, origin):
         if self.fail:
             raise LookupUnavailable("musicbrainz")
         return release(recording=recording_id, origin=origin, confidence=confidence)
-
-    async def enrich(self, draft, duration):
-        if self.barrier:
-            await self.barrier.wait()
-        if self.fail:
-            raise LookupUnavailable("musicbrainz")
-        return self.searched
 
 
 class FakeAnalyzer:
@@ -71,7 +65,7 @@ class FakeAnalyzer:
         return AudioFeatures(bpm=100, key="A minor", genres=[("Techno", 0.5)])
 
 
-def resolve(*, acoustid, musicbrainz, analyzer=None, llm_reply=None, info=None, model="m"):
+def resolve(*, acoustid=None, musicbrainz=None, analyzer=None, llm_reply=None, info=None, model="m"):
     requests = []
 
     def handler(request):
@@ -80,31 +74,30 @@ def resolve(*, acoustid, musicbrainz, analyzer=None, llm_reply=None, info=None, 
                   "year": None, "release": None, "confidence": 0.8, **(llm_reply or {})}
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(answer)}}]})
 
-    config = SimpleNamespace(
-        known_publishers=frozenset(), llm_model=model, llm_base_url="http://llm", llm_api_key="",
-        llm_json_mode="schema", llm_timeout_seconds=5, llm_description_chars=100, llm_call_log=None,
-    )
-
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-            resolver = MetadataResolver(config, acoustid, musicbrainz, LlmClient(http, config), analyzer or FakeAnalyzer())
+            resolver = MetadataResolver(
+                frozenset(),
+                acoustid or FakeAcoustId(),
+                musicbrainz or FakeMusicBrainz(),
+                LlmClient(http, llm_config(model=model), frozenset()),
+                analyzer or FakeAnalyzer(),
+            )
             return await resolver.resolve(info or INFO, "x.opus")
 
     return asyncio.run(run()), requests
 
 
-def test_every_source_runs_side_by_side():
-    barrier = Barrier(3)
-    resolution, _ = resolve(
-        acoustid=FakeAcoustId(barrier), musicbrainz=FakeMusicBrainz(barrier), analyzer=FakeAnalyzer(barrier)
-    )
+def test_identification_and_analysis_run_side_by_side():
+    barrier = Barrier(2)
+    resolution, _ = resolve(acoustid=FakeAcoustId(barrier), analyzer=FakeAnalyzer(barrier))
     assert resolution.findings.audio is not None
     assert [r.musicbrainz.recording_id for r in resolution.findings.releases] == ["rec1"]
 
 
 def test_the_llm_is_skipped_when_nothing_is_ambiguous():
     info = {**INFO, "artist": "Tidal Pools", "track": "Low Tide"}  # source tags: confidence 0.9, matches MusicBrainz
-    resolution, requests = resolve(acoustid=FakeAcoustId(), musicbrainz=FakeMusicBrainz(), info=info)
+    resolution, requests = resolve(info=info)
     assert requests == [] and resolution.findings.llm is None
     assert any(step.startswith("LLM: skipped") for step in resolution.steps)
 
@@ -112,40 +105,27 @@ def test_the_llm_is_skipped_when_nothing_is_ambiguous():
 def test_the_llm_is_asked_only_about_ambiguous_fields_and_cannot_override_the_rest():
     # The upload says "Low Tide (Official)" while MusicBrainz says "Low Tide": only the title is in dispute.
     info = {**INFO, "title": "Tidal Pools - Low Tide (Official Audio) feat", "artist": "Tidal Pools", "track": "Low Tide (feat)"}
-    resolution, requests = resolve(
-        acoustid=FakeAcoustId(), musicbrainz=FakeMusicBrainz(),
-        info=info, llm_reply={"title": "Low Tide", "artist": "Impostor", "album": "Nope"},
-    )
+    resolution, requests = resolve(info=info, llm_reply={"title": "Low Tide", "artist": "Impostor", "album": "Nope"})
     assert requests[0]["ask"] == ["title"]
     assert resolution.findings.llm.answers == {"title": "Low Tide"}
     metadata = reconcile(resolution.findings, Choices()).metadata
     assert (metadata.artist, metadata.album) == ("Tidal Pools", "Salt")
 
 
-def test_a_fingerprint_match_outranks_a_text_search_for_a_different_recording():
-    resolution, _ = resolve(
-        acoustid=FakeAcoustId(recordings=("verified",)),
-        musicbrainz=FakeMusicBrainz(searched=[release(recording="other", origin="musicbrainz", confidence=0.9)]),
-    )
-    assert [r.musicbrainz.recording_id for r in resolution.findings.releases] == ["verified"]
-    assert any("other recordings" in step for step in resolution.steps)
-
-
-def test_the_text_search_is_used_when_the_fingerprint_finds_nothing():
-    resolution, _ = resolve(
-        acoustid=FakeAcoustId(recordings=()),
-        musicbrainz=FakeMusicBrainz(searched=[release(recording="found", origin="musicbrainz", confidence=0.9)]),
-    )
-    assert [r.musicbrainz.recording_id for r in resolution.findings.releases] == ["found"]
-
-
-def test_an_outage_is_reported_once_and_the_other_sources_still_count():
-    resolution, _ = resolve(acoustid=FakeAcoustId(fail=True), musicbrainz=FakeMusicBrainz(fail=True))
-    assert resolution.unavailable_services == ["acoustid", "musicbrainz"]
+@pytest.mark.parametrize(
+    "acoustid, musicbrainz, service",
+    [
+        (FakeAcoustId(fail=True), FakeMusicBrainz(), "acoustid"),
+        (FakeAcoustId(recordings=("a", "b")), FakeMusicBrainz(fail=True), "musicbrainz"),
+    ],
+)
+def test_an_outage_is_reported_once_and_the_other_sources_still_count(acoustid, musicbrainz, service):
+    resolution, _ = resolve(acoustid=acoustid, musicbrainz=musicbrainz)
+    assert resolution.unavailable_services == [service]
     assert resolution.findings.audio is not None
     assert resolution.findings.releases == []
 
 
 def test_a_disabled_llm_is_skipped_without_a_request():
-    resolution, requests = resolve(acoustid=FakeAcoustId(recordings=()), musicbrainz=FakeMusicBrainz(), model="")
+    resolution, requests = resolve(acoustid=FakeAcoustId(recordings=()), model="")
     assert requests == [] and resolution.findings.llm is None

@@ -1,7 +1,11 @@
+"""Dataclasses shared by every module: what each source found, what the user chose, and the resulting metadata."""
+
 from dataclasses import asdict, dataclass, field
 
 REPLAYGAIN_REFERENCE_LUFS = -18.0
 R128_REFERENCE_LUFS = -23.0
+# Essentia's genre guesses below this probability are shown but never tagged.
+MIN_GENRE_CONFIDENCE = 0.10
 
 
 class LookupUnavailable(Exception):
@@ -66,6 +70,10 @@ class AudioFeatures:
     peak: float | None = None  # true peak, linear
 
     @property
+    def confident_genres(self) -> list[str]:
+        return [name for name, probability in self.genres if probability >= MIN_GENRE_CONFIDENCE]
+
+    @property
     def replaygain(self) -> float | None:
         """Gain in dB that brings the track to the ReplayGain 2.0 reference loudness."""
         return None if self.loudness is None else REPLAYGAIN_REFERENCE_LUFS - self.loudness
@@ -97,6 +105,11 @@ class TrackMetadata:
     def genre(self) -> str | None:
         """The main genre, used for display and the library path."""
         return self.genres[0] if self.genres else None
+
+    @property
+    def length_seconds(self) -> float | None:
+        """The recording's length as MusicBrainz knows it."""
+        return self.musicbrainz.length_seconds if self.musicbrainz else None
 
     @property
     def effective_album(self) -> str:

@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -10,7 +11,8 @@ from discord.ui import Button, Select, TextDisplay
 from music_sprite import review
 from music_sprite.bot import MusicBot
 from music_sprite.models import AudioFeatures, Findings, LlmVerdict
-from music_sprite.review import ReviewAction, apply_edits, build_review_pages
+from music_sprite.pipeline import ImportResult
+from music_sprite.review import ReviewAction, build_review_pages
 
 BIG_CREDITS = {f"role{i}": [f"Person {i}-{j}" for j in range(50)] for i in range(20)}
 NOISY_DESCRIPTION = "Line one\n@everyone buy my stuff\n" * 300
@@ -56,49 +58,44 @@ def heavy(make_entry):
 
 
 class TestPagination:
-    def test_a_small_card_is_one_message_with_the_buttons(self, bot, make_entry):
+    def test_a_small_card_is_one_message_with_the_buttons(self, make_entry):
         entry = make_entry()
         entry.set_findings(Findings(upload=upload(), releases=[release()]))
-        views = build_review_pages(bot, entry)
+        views = build_review_pages(entry)
         audit(views)
         assert len(views) == 1
         assert buttons(views[0]) == ["Approve", "Edit", "Re-lookup", "Close"]
 
-    def test_a_heavy_card_splits_within_discords_limits_and_buttons_come_last(self, bot, heavy):
-        views = build_review_pages(bot, heavy)
+    def test_a_heavy_card_splits_within_discords_limits_and_buttons_come_last(self, heavy):
+        views = build_review_pages(heavy)
         audit(views)
         assert len(views) > 1
         assert [buttons(view) for view in views[:-1]] == [[]] * (len(views) - 1)
         assert buttons(views[-1]) == ["Approve", "Edit", "Re-lookup", "Close"]
 
-    def test_every_field_is_still_shown_somewhere(self, bot, heavy):
-        everything = "\n".join(text for view in build_review_pages(bot, heavy) for text in texts(view))
+    def test_every_field_is_still_shown_somewhere(self, heavy):
+        everything = "\n".join(text for view in build_review_pages(heavy) for text in texts(view))
         for label in ("**Title**", "**Artist:**", "**Release**", "**Album:**", "**Genres:**", "**BPM:**", "Upload description"):
             assert label in everything
 
-    def test_each_conflict_gets_a_drop_down_with_the_current_choice_selected(self, bot, heavy):
-        views = build_review_pages(bot, heavy)
+    def test_each_conflict_gets_a_drop_down_with_the_current_choice_selected(self, heavy):
+        views = build_review_pages(heavy)
         selects = [item_of(c) for view in views for c in view.walk_children() if isinstance(item_of(c), Select)]
         assert len(selects) == 2  # release and title
         release_select = next(s for s in selects if s.custom_id.startswith("ms:r:release:"))
         assert [o.value for o in release_select.options if o.default] == ["4"]
 
-    def test_a_card_that_fills_the_last_message_gets_its_own_for_the_buttons(self, bot, make_entry):
+    def test_a_card_that_fills_the_last_message_gets_its_own_for_the_buttons(self, make_entry):
         entry = make_entry()
         entry.set_findings(Findings(upload=upload(), releases=[release()]))
         entry.resolve_steps = ["x" * 280 for _ in range(14)]  # fills a message to the brim
-        views = build_review_pages(bot, entry)
+        views = build_review_pages(entry)
         audit(views)
         assert buttons(views[-1]) == ["Approve", "Edit", "Re-lookup", "Close"]
 
-    def test_mentions_in_the_upload_text_are_defused(self, bot, heavy):
-        everything = "\n".join(text for view in build_review_pages(bot, heavy) for text in texts(view))
+    def test_mentions_in_the_upload_text_are_defused(self, heavy):
+        everything = "\n".join(text for view in build_review_pages(heavy) for text in texts(view))
         assert "@everyone" not in everything
-
-    def test_a_track_that_was_never_looked_up_still_gets_a_card(self, bot, make_entry):
-        entry = make_entry(info={"title": "Tidal Pools - Low Tide", "channel": "Tidal Pools"})
-        audit(build_review_pages(bot, entry))
-        assert (entry.meta.artist, entry.meta.title) == ("Tidal Pools", "Low Tide")
 
 
 class TestEdits:
@@ -110,9 +107,9 @@ class TestEdits:
     def test_only_what_differs_from_the_sources_is_recorded_as_edited(self, make_entry):
         entry = self._entry(make_entry)
         base = entry.meta
-        apply_edits(entry, {"title": base.title, "artist": base.artist, "album": base.album, "year": 1999, "genres": base.genres})
+        entry.apply_edits({"title": base.title, "artist": base.artist, "album": base.album, "year": 1999, "genres": base.genres})
         assert entry.choices.manual == {"year": 1999}
-        assert entry.edited
+        assert entry.edited and entry.meta.year == 1999
 
     def test_changing_the_artist_drops_the_album_artist_that_belonged_to_it(self, make_entry):
         entry = make_entry()
@@ -120,15 +117,14 @@ class TestEdits:
         match.album_artist = "Tidal Pools"
         entry.set_findings(Findings(upload=upload(), releases=[match]))
         base = entry.meta
-        apply_edits(entry, {"title": base.title, "artist": "Someone Else", "album": base.album, "year": base.year, "genres": base.genres})
-        entry.refresh_meta()
+        entry.apply_edits({"title": base.title, "artist": "Someone Else", "album": base.album, "year": base.year, "genres": base.genres})
         assert entry.meta.album_artist is None
 
     def test_editing_a_value_back_to_what_the_sources_say_clears_the_edit(self, make_entry):
         entry = self._entry(make_entry)
         entry.choices.manual = {"year": 1999}
         base = entry.reconcile().metadata
-        apply_edits(entry, {"title": base.title, "artist": base.artist, "album": base.album, "year": 2021, "genres": base.genres})
+        entry.apply_edits({"title": base.title, "artist": base.artist, "album": base.album, "year": 2021, "genres": base.genres})
         assert entry.choices.manual == {}
 
 
@@ -163,16 +159,18 @@ class FakeChannel:
 
 
 @pytest.fixture
-def discord_bot(bot):
+def discord_bot(staging):
     """A MusicBot whose channel is recorded instead of sent to."""
     instance = MusicBot.__new__(MusicBot)
-    instance.config, instance.staging = bot.config, bot.staging
+    instance.config = SimpleNamespace(lookup=SimpleNamespace(known_publishers=frozenset()))
+    instance.staging = staging
     instance.log = {"sent": [], "edited": [], "deleted": []}
     instance.vanished = set()
     counter = itertools.count(100)
     instance.get_partial_messageable = lambda channel_id: FakeChannel(instance.log, counter, instance.vanished)
-    instance.import_entry = AsyncMock(return_value="Added **x**")
-    instance.resolve_entry = AsyncMock()
+    instance.pipeline = SimpleNamespace(
+        import_entry=AsyncMock(return_value=ImportResult(upload(), error="x")), resolve_entry=AsyncMock()
+    )
     return instance
 
 
@@ -197,6 +195,13 @@ class TestPublishing:
         assert heavy.review_messages[0] == 7
         assert heavy.review_messages[1:] == discord_bot.log["sent"]
         assert discord_bot.staging.get("bbbbbbb2").review_messages == heavy.review_messages
+
+    def test_a_track_that_was_never_looked_up_still_gets_a_card(self, discord_bot, make_entry):
+        entry = make_entry(info={"title": "Tidal Pools - Low Tide", "channel": "Tidal Pools"})
+        run(discord_bot.publish_review(entry, 555))
+        saved = discord_bot.staging.get(entry.id)
+        assert (saved.meta.artist, saved.meta.title) == ("Tidal Pools", "Low Tide")
+        assert saved.review_messages == discord_bot.log["sent"]
 
     def test_a_release_pick_rederives_the_metadata_and_refreshes_every_message(self, discord_bot, heavy):
         discord_bot.staging.save(heavy)
@@ -258,7 +263,7 @@ class TestPublishing:
         discord_bot.log["deleted"].clear()
         run(ReviewAction("approve", heavy.id).callback(interaction))
         assert sorted(discord_bot.log["deleted"]) == sorted(set(heavy.review_messages) - {clicked})
-        assert discord_bot.import_entry.await_count == 1
+        assert discord_bot.pipeline.import_entry.await_count == 1
 
     def test_close_keeps_the_entry_and_forgets_the_card(self, discord_bot, heavy):
         discord_bot.staging.save(heavy)

@@ -1,16 +1,16 @@
 import asyncio
 import shutil
-from types import SimpleNamespace
 
 import pytest
 
 from music_sprite.analysis import AnalysisError, Analyzer
+from music_sprite.config import AnalysisConfig
 
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 
 
 def test_errors_cross_the_process_boundary_and_a_dead_worker_is_replaced(tmp_path):
-    analyzer = Analyzer(SimpleNamespace(analysis_enabled=True, analysis_model_dir=tmp_path, analysis_device="cpu"))
+    analyzer = Analyzer(AnalysisConfig(enabled=True, device="cpu", model_dir=tmp_path))
     missing = tmp_path / "missing.opus"
 
     async def attempt():

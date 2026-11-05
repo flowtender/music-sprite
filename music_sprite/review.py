@@ -10,38 +10,38 @@ brings its album, date, label, ...), so every message of the card is re-rendered
 """
 
 import re
-from dataclasses import dataclass, replace
 
 import discord
 from discord.ui import ActionRow, Button, DynamicItem, LayoutView, Section, Select, Separator, TextDisplay, Thumbnail
 
-from . import heuristics
-from .models import SOURCE_LABELS, AudioFeatures, Findings, TrackMetadata
-from .panels import (
+from . import describe
+from .models import SOURCE_LABELS, AudioFeatures, TrackMetadata
+from .reconcile import CHOOSABLE_FIELDS, FIELDS, RELEASE_FIELDS, Candidate, FieldReport, Reconciled
+from .staging import QueueEntry
+from .ui import (
+    MAX_SELECT_OPTIONS,
     STEP_MAX_CHARS,
     STYLE,
     AllowedUsersOnly,
+    Unit,
     accent,
     bot_of,
     container_view,
     edit_status_of,
-    lookup_progress,
+    escape,
+    import_message,
+    look_up,
     lookup_status,
+    paginate,
     status_view,
     truncate,
     unwrap,
 )
-from .reconcile import RELEASE_FIELDS, Candidate, FieldReport, Reconciled, reconcile
-from .staging import QueueEntry
 
-MAX_COMPONENTS = 40
-MAX_INTERACTIVE = 30
-MAX_TEXT = 4000
 # Room left on every page for its "page 2/3" tag, which is only known once the pages are counted.
 PAGE_TAG_MARGIN = 40
 UNIT_MAX_CHARS = 1500
-MAX_LISTED_RELEASES = 6
-MAX_SELECT_OPTIONS = 25
+MAX_SHOWN_RELEASES = 6
 DESCRIPTION_CHARS = 600
 
 REVIEW_ACTIONS = {
@@ -50,42 +50,37 @@ REVIEW_ACTIONS = {
     "lookup": ("Re-lookup", STYLE.secondary),
     "close": ("Close", STYLE.secondary),
 }
+ACTIONS_COMPONENTS = 1 + 1 + len(REVIEW_ACTIONS)  # separator, row, buttons
 LABELS = {"title": "Title", "artist": "Artist", "album": "Album", "album_artist": "Album artist", "year": "Year"}
 CHOSEN, OTHER = "✅", "▫️"
 
 
-def _escape(value: object) -> str:
-    return discord.utils.escape_mentions(discord.utils.escape_markdown(str(value)))
-
-
 def _field(label: str, value: object) -> str:
     shown = ", ".join(map(str, value)) if isinstance(value, (list, tuple)) else value
-    return f"**{label}:** {_escape(shown) if shown not in (None, '') else '*none*'}"
+    return f"**{label}:** {escape(shown) if shown not in (None, '') else '*none*'}"
+
+
+def _optional_field(label: str, value: object) -> str | None:
+    """A field line, or nothing when no source has a value; the optional details list only what was found."""
+    return _field(label, value) if value not in (None, "", [], ()) else None
 
 
 def _sources(candidate: Candidate) -> str:
     return ", ".join(SOURCE_LABELS[source] for source in candidate.sources)
 
 
-def _track_position(meta: TrackMetadata) -> str | None:
-    release = meta.release
-    if not release.track_number:
-        return None
-    position = f"{release.track_number}/{release.track_total}" if release.track_total else str(release.track_number)
-    if release.disc_total and release.disc_total > 1:
-        position += f" · disc {release.disc_number}/{release.disc_total}"
-    return position
-
-
-@dataclass
-class Unit:
-    """One field's worth of the card: its text, then optionally the drop-down that settles it."""
-
-    text: str
-    select: ActionRow | None = None
-
-
 # --- drop-downs -----------------------------------------------------------------------------------------------
+
+
+async def gone(interaction: discord.Interaction) -> None:
+    await interaction.response.edit_message(view=status_view("This track is no longer in the queue."))
+
+
+async def _choice_made(interaction: discord.Interaction, entry: QueueEntry) -> None:
+    bot = bot_of(interaction)
+    bot.staging.save(entry)
+    await interaction.response.defer()
+    await bot.sync_review(entry)
 
 
 class FieldSelect(AllowedUsersOnly, DynamicItem[Select], template=r"ms:r:field:(?P<id>\w+):(?P<field>\w+)"):
@@ -107,17 +102,11 @@ class FieldSelect(AllowedUsersOnly, DynamicItem[Select], template=r"ms:r:field:(
         return cls(match["id"], match["field"], unwrap(item).options)
 
     async def callback(self, interaction: discord.Interaction):
-        bot = bot_of(interaction)
-        entry = bot.staging.get(self.entry_id)
-        if entry is None or self.name not in LABELS:
+        entry = bot_of(interaction).staging.get(self.entry_id)
+        if entry is None or not entry.pick_field(self.name, interaction.data["values"][0]):
             await gone(interaction)
             return
-        entry.choices.fields[self.name] = interaction.data["values"][0]
-        entry.choices.manual.pop(self.name, None)
-        entry.refresh_meta()
-        bot.staging.save(entry)
-        await interaction.response.defer()
-        await bot.sync_review(entry)
+        await _choice_made(interaction, entry)
 
 
 class ReleaseSelect(AllowedUsersOnly, DynamicItem[Select], template=r"ms:r:release:(?P<id>\w+)"):
@@ -138,20 +127,11 @@ class ReleaseSelect(AllowedUsersOnly, DynamicItem[Select], template=r"ms:r:relea
         return cls(match["id"], unwrap(item).options)
 
     async def callback(self, interaction: discord.Interaction):
-        bot = bot_of(interaction)
-        entry = bot.staging.get(self.entry_id)
-        index = int(interaction.data["values"][0])
-        if entry is None or entry.findings is None or not 0 <= index < len(entry.findings.releases):
+        entry = bot_of(interaction).staging.get(self.entry_id)
+        if entry is None or not entry.pick_release(int(interaction.data["values"][0])):
             await gone(interaction)
             return
-        entry.choices.release = index
-        # Album, album artist and year belong to the release that was just replaced.
-        for name in RELEASE_FIELDS:
-            entry.choices.manual.pop(name, None)
-        entry.refresh_meta()
-        bot.staging.save(entry)
-        await interaction.response.defer()
-        await bot.sync_review(entry)
+        await _choice_made(interaction, entry)
 
 
 def _field_select(entry_id: str, report: FieldReport) -> ActionRow:
@@ -170,9 +150,9 @@ def _field_select(entry_id: str, report: FieldReport) -> ActionRow:
 def _release_select(entry_id: str, reconciled: Reconciled) -> ActionRow:
     options = [
         discord.SelectOption(
-            label=truncate(release.album or f"{release.title} (single)", 100),
+            label=truncate(describe.release_name(release), 100),
             value=str(index),
-            description=truncate(f"{release.year or '?'} · {release.artist} – {release.title}", 100),
+            description=truncate(f"{release.year or '?'} · {describe.artist_title(release)}", 100),
             default=index == reconciled.release_index,
         )
         for index, release in enumerate(reconciled.releases[:MAX_SELECT_OPTIONS])
@@ -194,7 +174,7 @@ def _field_unit(entry: QueueEntry, report: FieldReport, final: object) -> Unit:
         lines = [heading]
         for index, candidate in enumerate(report.candidates):
             mark = CHOSEN if index == report.chosen and not report.manual else OTHER
-            lines.append(f"{mark} {_escape(truncate(str(candidate.value), 200))} *({_sources(candidate)})*")
+            lines.append(f"{mark} {escape(truncate(str(candidate.value), 200))} *({_sources(candidate)})*")
         return Unit("\n".join(lines), _field_select(entry.id, report))
 
     text = _field(label, final)
@@ -205,17 +185,12 @@ def _field_unit(entry: QueueEntry, report: FieldReport, final: object) -> Unit:
     if len(report.candidates) > 1:
         # The release decides this field, so the other sources' values are shown only for comparison.
         others = [
-            f"{_escape(truncate(str(candidate.value), 100))} ({_sources(candidate)})"
+            f"{escape(truncate(str(candidate.value), 100))} ({_sources(candidate)})"
             for index, candidate in enumerate(report.candidates)
             if index != report.chosen
         ]
         text += "\n-# other sources: " + ", ".join(others)
     return Unit(text)
-
-
-def _present(label: str, value: object) -> str | None:
-    """A field line, or nothing when no source has a value; the optional details list only what was found."""
-    return _field(label, value) if value not in (None, "", [], ()) else None
 
 
 def _release_unit(entry: QueueEntry, reconciled: Reconciled) -> Unit | None:
@@ -224,21 +199,20 @@ def _release_unit(entry: QueueEntry, reconciled: Reconciled) -> Unit | None:
         return None
     releases = reconciled.releases
     lines = [f"**Release** · {len(releases)} equally good matches, pick one:"]
-    for index, option in enumerate(releases[:MAX_LISTED_RELEASES]):
+    for index, option in enumerate(releases[:MAX_SHOWN_RELEASES]):
         date = option.release.release_date or option.year
-        length = option.musicbrainz.length_seconds if option.musicbrainz else None
-        position = _track_position(option)
+        position = describe.track_position(option)
         extras = [
-            f"{option.artist} – {option.title}",
-            f"{int(length // 60)}:{int(length % 60):02d}" if length else None,
+            describe.artist_title(option),
+            describe.duration(option.length_seconds) if option.length_seconds else None,
             f"track {position}" if position else None,
             option.release.label,
             option.release.country,
         ]
-        album = _escape(truncate(option.album or f"{option.title} (single)", 120))
+        album = escape(truncate(describe.release_name(option), 120))
         lines.append(f"{CHOSEN if index == reconciled.release_index else OTHER} **{album}**" + (f" ({date})" if date else ""))
-        lines.append("-# " + _escape(" · ".join(extra for extra in extras if extra)))
-    hidden = len(releases) - MAX_LISTED_RELEASES
+        lines.append("-# " + escape(" · ".join(extra for extra in extras if extra)))
+    hidden = len(releases) - MAX_SHOWN_RELEASES
     if hidden > 0:
         lines.append(f"-# …and {hidden} more in the drop-down")
     return Unit("\n".join(lines), _release_select(entry.id, reconciled))
@@ -246,18 +220,17 @@ def _release_unit(entry: QueueEntry, reconciled: Reconciled) -> Unit | None:
 
 def _release_details(meta: TrackMetadata) -> str:
     release = meta.release
-    catalog = f"{release.label} {release.catalog_number}" if release.label and release.catalog_number else release.label
     lines = [
-        _present("Release date", release.release_date),
-        _present("Original date", release.original_date if release.original_date != release.release_date else None),
-        _present("Track", _track_position(meta)),
-        _present("Label", catalog),
-        _present("Barcode", release.barcode),
-        _present("Country", release.country),
-        _present("Release type", " / ".join(filter(None, [*release.types, release.status, release.media_format]))),
-        _present("Language", " · ".join(filter(None, [release.language, release.script]))),
-        _present("ISRC", release.isrcs),
-        _present("ISWC", release.iswcs),
+        _optional_field("Release date", release.release_date),
+        _optional_field("Original date", release.original_date if release.original_date != release.release_date else None),
+        _optional_field("Track", describe.track_position(meta)),
+        _optional_field("Label", describe.label(meta)),
+        _optional_field("Barcode", release.barcode),
+        _optional_field("Country", release.country),
+        _optional_field("Release type", " / ".join(filter(None, [*release.types, release.status, release.media_format]))),
+        _optional_field("Language", " · ".join(filter(None, [release.language, release.script]))),
+        _optional_field("ISRC", release.isrcs),
+        _optional_field("ISWC", release.iswcs),
     ]
     if meta.musicbrainz:
         ids = meta.musicbrainz
@@ -283,25 +256,20 @@ def _credits_unit(meta: TrackMetadata) -> str:
 def _audio_unit(audio: AudioFeatures | None) -> str:
     if audio is None:
         return _field("Audio analysis", None)
-    vocals = None
-    if audio.vocals:
-        vocals = "instrumental" if audio.vocals == "instrumental" else f"{audio.vocals} vocals"
-    loudness = None
-    if audio.loudness is not None and audio.replaygain is not None:
-        loudness = f"{audio.loudness:.1f} LUFS · ReplayGain {audio.replaygain:+.1f} dB"
-        if audio.loudness_range is not None:
-            loudness += f" · range {audio.loudness_range:.1f} LU"
-        if audio.peak is not None:
-            loudness += f" · peak {audio.peak:.2f}"
+    loudness = describe.loudness(audio)
+    if loudness and audio.loudness_range is not None:
+        loudness += f" · range {audio.loudness_range:.1f} LU"
+    if loudness and audio.peak is not None:
+        loudness += f" · peak {audio.peak:.2f}"
     lines = [
         _field("BPM", audio.bpm),
         _field("Key", audio.key),
-        _present("Vocals", vocals),
-        _present("Genre guesses", [f"{name} {probability:.0%}" for name, probability in audio.genres]),
-        _present("Moods", audio.moods),
-        _present("Instruments", audio.instruments),
-        _present("Scores", [f"{name} {score:.0%}" for name, score in audio.scores.items()]),
-        _present("Loudness", loudness),
+        _optional_field("Vocals", describe.vocals(audio)),
+        _optional_field("Genre guesses", [f"{name} {probability:.0%}" for name, probability in audio.genres]),
+        _optional_field("Moods", audio.moods),
+        _optional_field("Instruments", audio.instruments),
+        _optional_field("Scores", [f"{name} {score:.0%}" for name, score in audio.scores.items()]),
+        _optional_field("Loudness", loudness),
     ]
     return "\n".join(line for line in lines if line)
 
@@ -310,7 +278,7 @@ def _description_unit(info: dict) -> Unit | None:
     description = (info.get("description") or "").strip()
     if not description:
         return None
-    quoted = "\n".join(f"> {line}" for line in _escape(truncate(description, DESCRIPTION_CHARS)).splitlines())
+    quoted = "\n".join(f"> {line}" for line in escape(truncate(description, DESCRIPTION_CHARS)).splitlines())
     return Unit(f"**Upload description** *(the LLM reads all of it, so check it for anything odd)*\n{quoted}")
 
 
@@ -322,14 +290,14 @@ def build_units(entry: QueueEntry, reconciled: Reconciled) -> list[Unit]:
         if text:
             units.append(Unit(truncate(text, UNIT_MAX_CHARS), select))
 
-    values = {"title": meta.title, "artist": meta.artist, "album": meta.album, "album_artist": meta.album_artist, "year": meta.year}
+    values = {name: getattr(meta, name) for name in FIELDS}
     if entry.resolve_error:
-        add(f"⚠️ {_escape(entry.resolve_error)}")
-    for name in ("title", "artist"):
+        add(f"⚠️ {escape(entry.resolve_error)}")
+    for name in CHOOSABLE_FIELDS:
         units.append(_field_unit(entry, reconciled.fields[name], values[name]))
     if release := _release_unit(entry, reconciled):
         units.append(release)
-    for name in ("album", "album_artist", "year"):
+    for name in RELEASE_FIELDS:
         report = reconciled.fields[name]
         if name == "album_artist" and not report.candidates and not report.manual:
             continue
@@ -341,83 +309,20 @@ def build_units(entry: QueueEntry, reconciled: Reconciled) -> list[Unit]:
     if description := _description_unit(entry.info):
         units.append(description)
     for step in entry.resolve_steps:
-        add(f"-# {_escape(truncate(step, STEP_MAX_CHARS))}")
+        add(f"-# {escape(truncate(step, STEP_MAX_CHARS))}")
     return units
 
 
-# --- pagination -----------------------------------------------------------------------------------------------
-
-
-class _Page:
-    def __init__(self, components: int, text: int):
-        self.children: list = []
-        self._lines: list[str] = []
-        self.components = components
-        self.text = text
-        self.interactive = 0
-
-    def fits(self, unit: Unit) -> bool:
-        components = self.components + (0 if self._lines else 1) + (2 if unit.select else 0)
-        text = self.text + len(unit.text) + (1 if self._lines else 0)
-        interactive = self.interactive + (1 if unit.select else 0)
-        return components <= MAX_COMPONENTS and text <= MAX_TEXT and interactive <= MAX_INTERACTIVE
-
-    def add(self, unit: Unit) -> None:
-        self.components += 0 if self._lines else 1
-        self.text += len(unit.text) + (1 if self._lines else 0)
-        self._lines.append(unit.text)
-        if unit.select:
-            self.flush()
-            self.children.append(unit.select)
-            self.components += 2
-            self.interactive += 1
-
-    def flush(self) -> None:
-        if self._lines:
-            self.children.append(TextDisplay("\n".join(self._lines)))
-            self._lines = []
-
-    @property
-    def empty(self) -> bool:
-        return not self._lines and not self.children
-
-
-ACTIONS_COMPONENTS = 1 + 1 + len(REVIEW_ACTIONS)  # separator, row, buttons
-
-
-def paginate(units: list[Unit], first_components: int, first_text: int, later_components: int, later_text: int) -> list[_Page]:
-    """Packs units, in order, into as few messages as the limits allow, leaving room for the buttons on the last."""
-    pages = [_Page(first_components, first_text)]
-    for unit in units:
-        if not pages[-1].fits(unit) and not pages[-1].empty:
-            pages.append(_Page(later_components, later_text))
-        pages[-1].add(unit)
-    last = pages[-1]
-    last.flush()
-    if last.components + ACTIONS_COMPONENTS > MAX_COMPONENTS or last.interactive + len(REVIEW_ACTIONS) > MAX_INTERACTIVE:
-        pages.append(_Page(later_components, later_text))
-    for page in pages:
-        page.flush()
-    return pages
-
-
-def ensure_findings(bot, entry: QueueEntry) -> None:
-    """A track that was never looked up (or whose lookup crashed) still gets a card, from its own tags."""
-    if entry.findings is None:
-        entry.findings = Findings(upload=heuristics.guess(entry.info, bot.config.known_publishers))
-        entry.refresh_meta()
-        bot.staging.save(entry)
-
-
-def build_review_pages(bot, entry: QueueEntry) -> list[LayoutView]:
-    ensure_findings(bot, entry)
+def build_review_pages(entry: QueueEntry) -> list[LayoutView]:
+    """The card's messages, first to last. The entry needs findings (QueueEntry.ensure_findings)."""
     reconciled = entry.reconcile()
-    assert reconciled is not None
+    assert reconciled is not None, "the entry has no findings"
     meta = reconciled.metadata
 
-    title = f"### {_escape(meta.title)}"
+    title = f"### {escape(meta.title)}"
     thumbnail_url = entry.info.get("thumbnail")
-    note = f"-# {_escape(entry.review_note)}" if entry.review_note else None
+    note = f"-# {escape(entry.review_note)}" if entry.review_note else None
+    track = escape(describe.artist_title(meta))
 
     def subline(page: int, count: int) -> str:
         parts = [f"source: {meta.origin} · confidence {meta.confidence:.0%}"]
@@ -426,11 +331,21 @@ def build_review_pages(bot, entry: QueueEntry) -> list[LayoutView]:
             parts.append(f"page {page}/{count}")
         return "-# " + " · ".join(parts)
 
+    def page_tag(page: int, count: int) -> str:
+        return f"-# {track} · page {page}/{count} · `{entry.id}`"
+
     header_text = title + "\n" + subline(1, 1)
     first_components = 1 + (3 if thumbnail_url else 1) + (1 if note else 0)
     first_text = len(header_text) + len(note or "") + PAGE_TAG_MARGIN
-    tag_example = f"-# {_escape(meta.artist)} – {_escape(meta.title)} · page 10/10 · `{entry.id}`"
-    pages = paginate(build_units(entry, reconciled), first_components, first_text, 2, len(tag_example) + PAGE_TAG_MARGIN)
+    pages = paginate(
+        build_units(entry, reconciled),
+        first_components,
+        first_text,
+        2,
+        len(page_tag(10, 10)) + PAGE_TAG_MARGIN,
+        reserve_components=ACTIONS_COMPONENTS,
+        reserve_interactive=len(REVIEW_ACTIONS),
+    )
 
     views = []
     for number, page in enumerate(pages, start=1):
@@ -440,8 +355,8 @@ def build_review_pages(bot, entry: QueueEntry) -> list[LayoutView]:
             if note:
                 children.append(TextDisplay(note))
         else:
-            children = [TextDisplay(f"-# {_escape(meta.artist)} – {_escape(meta.title)} · page {number}/{len(pages)} · `{entry.id}`")]
-        children.extend(page.children)
+            children = [TextDisplay(page_tag(number, len(pages)))]
+        children.extend(page)
         if number == len(pages):
             children.append(Separator())
             children.append(ActionRow(*(ReviewAction(action, entry.id) for action in REVIEW_ACTIONS)))
@@ -450,10 +365,6 @@ def build_review_pages(bot, entry: QueueEntry) -> list[LayoutView]:
 
 
 # --- buttons and editing --------------------------------------------------------------------------------------
-
-
-async def gone(interaction: discord.Interaction) -> None:
-    await interaction.response.edit_message(view=status_view("This track is no longer in the queue."))
 
 
 class ReviewAction(AllowedUsersOnly, DynamicItem[Button], template=r"ms:r:(?P<action>approve|edit|lookup|close):(?P<id>\w+)"):
@@ -483,15 +394,15 @@ class ReviewAction(AllowedUsersOnly, DynamicItem[Button], template=r"ms:r:(?P<ac
                 return
             await interaction.response.edit_message(view=status_view("Tagging and adding to library…"))
             await bot.discard_review_pages(entry, keep=clicked.id)
-            await interaction.edit_original_response(view=status_view(await bot.import_entry(entry)))
+            result = await bot.pipeline.import_entry(entry)
+            await interaction.edit_original_response(view=status_view(import_message(result)))
         elif self.action == "edit":
-            ensure_findings(bot, entry)
-            await interaction.response.send_modal(EditModal(bot, entry))
+            entry.ensure_findings(bot.config.lookup.known_publishers)
+            await interaction.response.send_modal(EditModal(entry))
         elif self.action == "lookup":
             await interaction.response.edit_message(view=status_view(lookup_status(entry, 1, 1)))
             await bot.discard_review_pages(entry, keep=clicked.id)
-            progress = lookup_progress(entry, 1, 1, edit_status_of(interaction))
-            await bot.resolve_entry(entry, overwrite_edits=True, progress=progress)
+            await look_up(bot.pipeline, [entry], edit_status_of(interaction), overwrite_edits=True)
             await bot.publish_review(entry, interaction.channel_id, first=clicked)
         else:
             await interaction.response.edit_message(view=status_view(f"Closed. `{entry.id}` is still in the queue."))
@@ -500,21 +411,9 @@ class ReviewAction(AllowedUsersOnly, DynamicItem[Button], template=r"ms:r:(?P<ac
             bot.staging.save(entry)
 
 
-def apply_edits(entry: QueueEntry, entered: dict[str, object]) -> None:
-    """Records what differs from what the sources would give as hand edits, so choices made later still apply."""
-    assert entry.findings is not None
-    base = reconcile(entry.findings, replace(entry.choices, manual={})).metadata
-    manual = {name: value for name, value in entered.items() if value != getattr(base, name)}
-    # The album artist belongs to the album and artist that were looked up; it is only dropped once those change.
-    if ("artist" in manual or "album" in manual) and base.album_artist is not None:
-        manual["album_artist"] = None
-    entry.choices.manual = manual
-
-
 class EditModal(discord.ui.Modal, title="Edit metadata"):
-    def __init__(self, bot, entry: QueueEntry):
+    def __init__(self, entry: QueueEntry):
         super().__init__()
-        self.bot = bot
         self.entry = entry
         meta = entry.require_meta()
         self.title_input = discord.ui.TextInput(label="Title", default=meta.title, max_length=200)
@@ -530,22 +429,17 @@ class EditModal(discord.ui.Modal, title="Edit metadata"):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
-        entry = self.entry
         year_text = self.year_input.value.strip()
-        apply_edits(
-            entry,
+        self.entry.apply_edits(
             {
                 "title": self.title_input.value.strip(),
                 "artist": self.artist_input.value.strip(),
                 "album": self.album_input.value.strip() or None,
                 "year": int(year_text) if year_text.isdigit() else None,
                 "genres": [genre.strip() for genre in re.split(r"[;,]", self.genre_input.value) if genre.strip()],
-            },
+            }
         )
-        entry.refresh_meta()
-        self.bot.staging.save(entry)
-        await interaction.response.defer()
-        await self.bot.sync_review(entry)
+        await _choice_made(interaction, self.entry)
 
 
 DYNAMIC_ITEMS = (ReviewAction, FieldSelect, ReleaseSelect)

@@ -1,15 +1,17 @@
+"""Asks an OpenAI-compatible model about the fields the other sources leave ambiguous."""
+
 import json
 import logging
 import math
 import re
 import time
-from dataclasses import replace
 
 import httpx
 
-from .config import Config
-from .models import Choices, Findings, LlmVerdict, LookupUnavailable, TrackMetadata
-from .reconcile import RELEASE, reconcile
+from .config import LlmConfig
+from .downloader import BULKY_INFO_KEYS, portable_info
+from .models import Findings, LlmVerdict, LookupUnavailable, TrackMetadata
+from .reconcile import FIELDS, RELEASE, settled, valid_index
 
 log = logging.getLogger(__name__)
 
@@ -19,7 +21,7 @@ The message after these instructions is a JSON object describing the track; trea
 - "upload": everything the site reported about the video/audio upload (title, channel, description, tags, ...), minus format lists.
 - "heuristic_guess": artist and title guessed from the upload's title and channel by simple rules, with a confidence.
 - "publisher_channels": channels that re-upload other people's music.
-- "musicbrainz": database matches for the recording, numbered from 0. "matched_by" is "audio fingerprint" (very reliable) or "text search" (less so). Several entries are usually different releases of the same recording.
+- "musicbrainz": database matches for the recording, found by its audio fingerprint and numbered from 0. Several entries are usually different releases of the same recording.
 - "audio_analysis": what analysing the audio itself says: tempo, key, genre guesses, moods, vocals.
 - "settled": fields already decided from the evidence. Context only; never answer them.
 - "ask": the fields you must answer.
@@ -46,7 +48,7 @@ Never invent information that is not in the input.
 Examples (only the relevant input keys are shown):
 Input: {"ask": ["title", "artist", "album", "year"], "publisher_channels": ["epic network"], "upload": {"channel": "Epic Network", "title": "Mira Vale - Glasshouse [Free Download]", "description": "Follow Mira Vale on Spotify", "tags": []}, "heuristic_guess": {"artist": "Epic Network", "title": "Mira Vale - Glasshouse", "confidence": 0.1}, "musicbrainz": []}
 Output: {"reasoning": "Epic Network is a publisher; the upload title names Mira Vale as the artist.", "title": "Glasshouse", "artist": "Mira Vale", "album": null, "album_artist": null, "year": null, "release": null, "confidence": 0.9}
-Input: {"ask": ["release"], "settled": {"title": "Low Tide", "artist": "Tidal Pools"}, "upload": {"channel": "Tidal Pools", "title": "Low Tide (Official Audio)", "description": "From the album Salt, 2021."}, "musicbrainz": [{"index": 0, "matched_by": "audio fingerprint", "album": "Best of Tidal Pools", "date": "2023"}, {"index": 1, "matched_by": "audio fingerprint", "album": "Salt", "date": "2021"}]}
+Input: {"ask": ["release"], "settled": {"title": "Low Tide", "artist": "Tidal Pools"}, "upload": {"channel": "Tidal Pools", "title": "Low Tide (Official Audio)", "description": "From the album Salt, 2021."}, "musicbrainz": [{"index": 0, "album": "Best of Tidal Pools", "date": "2023"}, {"index": 1, "album": "Salt", "date": "2021"}]}
 Output: {"reasoning": "The description names the album Salt, which is entry 1.", "title": null, "artist": null, "album": null, "album_artist": null, "year": null, "release": 1, "confidence": 0.9}"""
 
 _NULLABLE_STRING = {"anyOf": [{"type": "string"}, {"type": "null"}]}
@@ -71,17 +73,13 @@ RESPONSE_SCHEMA = {
 THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 # The upload's metadata goes to the model whole, since other sites (Bandcamp, SoundCloud, ...) report different
-# things than YouTube does; only what is bulky and says nothing about the music is dropped.
-DROPPED_KEYS = frozenset(
-    {
-        "formats", "requested_formats", "requested_downloads", "requested_subtitles", "thumbnails", "thumbnail",
-        "subtitles", "automatic_captions", "http_headers", "storyboards", "heatmap", "fragments", "url",
-        "manifest_url", "filename", "epoch", "format", "format_id", "format_note", "ext", "protocol", "resolution",
-        "acodec", "vcodec", "abr", "vbr", "asr", "tbr", "audio_channels", "dynamic_range", "container", "filesize",
-        "filesize_approx", "language_preference", "quality", "source_preference", "preference", "has_drm",
-        "stretched_ratio", "aspect_ratio", "width", "height", "fps", "video_ext", "audio_ext",
-    }
-)
+# things than YouTube does; only what is bulky or describes the file format rather than the music is dropped.
+DROPPED_KEYS = BULKY_INFO_KEYS | {
+    "thumbnail", "storyboards", "fragments", "filename", "epoch", "format", "format_id", "format_note", "ext",
+    "protocol", "resolution", "acodec", "vcodec", "abr", "vbr", "asr", "tbr", "audio_channels", "dynamic_range",
+    "container", "filesize", "filesize_approx", "language_preference", "quality", "source_preference", "preference",
+    "has_drm", "stretched_ratio", "aspect_ratio", "width", "height", "fps", "video_ext", "audio_ext",
+}
 
 
 def _text(value: object) -> str | None:
@@ -110,11 +108,7 @@ def _present(facts: dict) -> dict:
 
 
 def trim_upload(info: dict, description_chars: int) -> dict:
-    trimmed = {
-        key: value
-        for key, value in info.items()
-        if key not in DROPPED_KEYS and not key.startswith("_") and value not in (None, "", [], {})
-    }
+    trimmed = _present(portable_info(info, DROPPED_KEYS))
     if isinstance(trimmed.get("description"), str):
         trimmed["description"] = trimmed["description"][:description_chars]
     return trimmed
@@ -122,12 +116,10 @@ def trim_upload(info: dict, description_chars: int) -> dict:
 
 def _release_facts(index: int, meta: TrackMetadata) -> dict:
     release = meta.release
-    length = meta.musicbrainz.length_seconds if meta.musicbrainz else None
     position = f"{release.track_number}/{release.track_total}" if release.track_number and release.track_total else None
     return _present(
         {
             "index": index,
-            "matched_by": "audio fingerprint" if meta.origin.startswith("acoustid") else "text search",
             "artist": meta.artist,
             "title": meta.title,
             "album": meta.album,
@@ -141,7 +133,7 @@ def _release_facts(index: int, meta: TrackMetadata) -> dict:
             "status": release.status,
             "release_types": release.types,
             "genres": meta.genres,
-            "length_seconds": round(length) if length else None,
+            "length_seconds": round(meta.length_seconds) if meta.length_seconds else None,
             "credits": {role: names[:5] for role, names in release.credits.items()},
         }
     )
@@ -166,13 +158,14 @@ def _audio_facts(findings: Findings) -> dict | None:
 
 
 class LlmClient:
-    def __init__(self, http: httpx.AsyncClient, config: Config):
+    def __init__(self, http: httpx.AsyncClient, config: LlmConfig, known_publishers: frozenset[str]):
         self._http = http
         self._config = config
+        self._known_publishers = known_publishers
 
     @property
     def enabled(self) -> bool:
-        return bool(self._config.llm_model)
+        return bool(self._config.model)
 
     async def resolve(self, info: dict, findings: Findings, asked: list[str]) -> LlmVerdict:
         """Answers the asked fields from everything the other sources found. Raises LookupUnavailable."""
@@ -180,10 +173,10 @@ class LlmClient:
         started = time.monotonic()
         try:
             response = await self._http.post(
-                f"{self._config.llm_base_url}/chat/completions",
+                f"{self._config.base_url}/chat/completions",
                 json=self._request_body(facts),
                 headers=self._headers(),
-                timeout=self._config.llm_timeout_seconds,
+                timeout=self._config.timeout_seconds,
             )
             response.raise_for_status()
             payload = response.json()
@@ -195,7 +188,7 @@ class LlmClient:
 
         self._log_call(info, started, payload.get("usage"), asked, parsed, None)
         return LlmVerdict(
-            model=self._config.llm_model,
+            model=self._config.model,
             asked=asked,
             answers=self._answers(parsed, asked, len(findings.releases)),
             reasoning=_text(parsed.get("reasoning")) or "",
@@ -211,7 +204,7 @@ class LlmClient:
             if name == "year":
                 value = _year(value)
             elif name == RELEASE:
-                value = value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < release_count else None
+                value = value if valid_index(value, release_count) else None
             else:
                 value = _text(value)
             if value is not None:
@@ -220,20 +213,13 @@ class LlmClient:
 
     def _facts(self, info: dict, findings: Findings, asked: list[str]) -> dict:
         upload = findings.upload
-        settled = reconcile(replace(findings, llm=None), Choices()).metadata
-        decided = {
-            "title": settled.title,
-            "artist": settled.artist,
-            "album": settled.album,
-            "album_artist": settled.album_artist,
-            "year": settled.year,
-        }
+        decided = settled(findings).metadata
         return _present(
             {
                 "ask": asked,
-                "settled": _present({name: value for name, value in decided.items() if name not in asked}),
-                "publisher_channels": sorted(self._config.known_publishers),
-                "upload": trim_upload(info, self._config.llm_description_chars),
+                "settled": _present({name: getattr(decided, name) for name in FIELDS if name not in asked}),
+                "publisher_channels": sorted(self._known_publishers),
+                "upload": trim_upload(info, self._config.description_chars),
                 "heuristic_guess": _present(
                     {
                         "artist": upload.artist,
@@ -251,7 +237,7 @@ class LlmClient:
 
     def _request_body(self, facts: dict) -> dict:
         body = {
-            "model": self._config.llm_model,
+            "model": self._config.model,
             "temperature": 0,
             "max_tokens": 700,
             "messages": [
@@ -259,18 +245,18 @@ class LlmClient:
                 {"role": "user", "content": json.dumps(facts, ensure_ascii=False)},
             ],
         }
-        if self._config.llm_json_mode == "schema":
+        if self._config.json_mode == "schema":
             body["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {"name": "track_metadata", "strict": True, "schema": RESPONSE_SCHEMA},
             }
-        elif self._config.llm_json_mode == "object":
+        elif self._config.json_mode == "object":
             body["response_format"] = {"type": "json_object"}
         return body
 
     def _headers(self) -> dict:
-        if self._config.llm_api_key:
-            return {"Authorization": f"Bearer {self._config.llm_api_key}"}
+        if self._config.api_key:
+            return {"Authorization": f"Bearer {self._config.api_key}"}
         return {}
 
     @staticmethod
@@ -290,12 +276,12 @@ class LlmClient:
     def _log_call(
         self, info: dict, started: float, usage: dict | None, asked: list[str], parsed: dict | None, error: str | None
     ):
-        if not self._config.llm_call_log:
+        if not self._config.call_log:
             return
         record = {
             "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "model": self._config.llm_model,
-            "base_url": self._config.llm_base_url,
+            "model": self._config.model,
+            "base_url": self._config.base_url,
             "seconds": round(time.monotonic() - started, 2),
             "usage": usage,
             "url": info.get("webpage_url"),
@@ -304,8 +290,8 @@ class LlmClient:
             "error": error,
         }
         try:
-            self._config.llm_call_log.parent.mkdir(parents=True, exist_ok=True)
-            with self._config.llm_call_log.open("a", encoding="utf-8") as handle:
+            self._config.call_log.parent.mkdir(parents=True, exist_ok=True)
+            with self._config.call_log.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError as os_error:
             log.warning("could not write LLM call log: %s", os_error)

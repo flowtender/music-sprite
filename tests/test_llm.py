@@ -1,27 +1,12 @@
 import asyncio
 import json
-from types import SimpleNamespace
 
 import httpx
 import pytest
-from conftest import release, upload
+from conftest import llm_config, release, upload
 
 from music_sprite.llm import LlmClient, trim_upload
 from music_sprite.models import AudioFeatures, Findings, LookupUnavailable
-
-
-def config(**overrides):
-    values = dict(
-        known_publishers=frozenset({"epic network"}),
-        llm_model="m",
-        llm_base_url="http://llm",
-        llm_api_key="",
-        llm_json_mode="schema",
-        llm_timeout_seconds=5,
-        llm_description_chars=100,
-        llm_call_log=None,
-    )
-    return SimpleNamespace(**{**values, **overrides})
 
 
 def reply(**fields):
@@ -33,7 +18,8 @@ def reply(**fields):
 def resolve(findings, asked, handler, info=None):
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-            return await LlmClient(http, config()).resolve(info or {"title": "t"}, findings, asked)
+            client = LlmClient(http, llm_config(), frozenset({"epic network"}))
+            return await client.resolve(info or {"title": "t"}, findings, asked)
 
     return asyncio.run(run())
 
@@ -74,7 +60,6 @@ class TestRequest:
         assert seen["upload"] == {"title": "t", "uploader": "u"}
         assert "title" not in seen["settled"] and seen["settled"]["artist"] == "Tidal Pools"
         assert [entry["album"] for entry in seen["musicbrainz"]] == ["Salt", "Live"]
-        assert seen["musicbrainz"][0]["matched_by"] == "audio fingerprint"
         assert seen["audio_analysis"]["bpm"] == 120
 
 

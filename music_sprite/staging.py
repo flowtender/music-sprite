@@ -1,16 +1,26 @@
+"""The import queue on disk: one folder per downloaded track with its files and an entry.json."""
+
 import json
 import shutil
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 
+from . import heuristics
 from .downloader import DownloadedTrack
 from .models import Choices, Findings, TrackMetadata
-from .reconcile import Reconciled, reconcile
+from .reconcile import FIELDS, RELEASE_FIELDS, Reconciled, reconcile, valid_index
 
 ENTRY_FILE = "entry.json"
 INCOMING_DIR = ".incoming"
+
+
+class EntryStatus(StrEnum):
+    PENDING = "pending"  # not looked up yet, or the lookup crashed
+    PARTIAL = "partial"  # looked up, but a service was unavailable
+    RESOLVED = "resolved"
 
 
 @dataclass
@@ -24,7 +34,7 @@ class QueueEntry:
     requested_by: int
     batch_id: str
     created_at: str
-    status: str = "pending"
+    status: EntryStatus = EntryStatus.PENDING
     resolve_error: str | None = None
     resolve_steps: list[str] = field(default_factory=list)
     findings: Findings | None = None
@@ -76,6 +86,43 @@ class QueueEntry:
         self.choices = Choices()
         self.refresh_meta()
 
+    def ensure_findings(self, known_publishers: frozenset[str]) -> None:
+        """A track that was never looked up (or whose lookup crashed) still gets a card, from its own tags."""
+        if self.findings is None:
+            self.findings = Findings(upload=heuristics.guess(self.info, known_publishers))
+            self.refresh_meta()
+
+    def pick_field(self, name: str, source: str) -> bool:
+        """Takes the field from that source, replacing a hand edit of it. False for a field that cannot be picked."""
+        if name not in FIELDS:
+            return False
+        self.choices.fields[name] = source
+        self.choices.manual.pop(name, None)
+        self.refresh_meta()
+        return True
+
+    def pick_release(self, index: int) -> bool:
+        """False when there is no such release (the card was older than the last lookup)."""
+        if self.findings is None or not valid_index(index, len(self.findings.releases)):
+            return False
+        self.choices.release = index
+        # Album, album artist and year belong to the release that was just replaced.
+        for name in RELEASE_FIELDS:
+            self.choices.manual.pop(name, None)
+        self.refresh_meta()
+        return True
+
+    def apply_edits(self, entered: dict[str, object]) -> None:
+        """Records what differs from what the sources would give as hand edits, so choices made later still apply."""
+        assert self.findings is not None
+        base = reconcile(self.findings, replace(self.choices, manual={})).metadata
+        manual = {name: value for name, value in entered.items() if value != getattr(base, name)}
+        # The album artist belongs to the album and artist that were looked up; it is only dropped once those change.
+        if ("artist" in manual or "album" in manual) and base.album_artist is not None:
+            manual["album_artist"] = None
+        self.choices.manual = manual
+        self.refresh_meta()
+
     def require_meta(self) -> TrackMetadata:
         if self.meta is None:
             raise ValueError(f"queue entry {self.id} has no metadata yet")
@@ -104,14 +151,17 @@ class QueueEntry:
 
     @classmethod
     def from_json(cls, directory: Path, data: dict) -> "QueueEntry":
-        meta = TrackMetadata.from_dict(data.pop("meta")) if data.get("meta") else None
+        meta = data.pop("meta", None)
+        meta = TrackMetadata.from_dict(meta) if meta else None
         findings = data.pop("findings", None)
         choices = data.pop("choices", None)
+        status = EntryStatus(data.pop("status", EntryStatus.PENDING))
         # Entries saved before lookups kept their findings: the tags they had become the one source they now have.
         for legacy_key in ("edited", "candidates", "candidate_index"):
             data.pop(legacy_key, None)
         return cls(
             directory=directory,
+            status=status,
             meta=meta,
             findings=Findings.from_dict(findings) if findings else Findings(upload=meta, audio=meta.audio) if meta else None,
             choices=Choices.from_dict(choices) if choices else Choices(),

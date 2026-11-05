@@ -22,7 +22,7 @@ from pathlib import Path
 
 import httpx
 
-from .config import Config
+from .config import AnalysisConfig
 from .models import AudioFeatures
 
 log = logging.getLogger(__name__)
@@ -32,7 +32,6 @@ MIN_AUDIO_SECONDS = 5
 FFMPEG_TIMEOUT_SECONDS = 300
 GENRE_SEPARATOR = "---"
 
-MIN_GENRE_CONFIDENCE = 0.10
 TOP_GENRES = 3
 # Probabilities of the binary heads count as a yes above this.
 POSITIVE = 0.5
@@ -100,33 +99,6 @@ MODEL_FILES = _model_files()
 
 class AnalysisError(RuntimeError):
     """The audio could not be analyzed; the message is shown to the user."""
-
-
-def guessed_genres(features: AudioFeatures) -> list[str]:
-    return [name for name, probability in features.genres if probability >= MIN_GENRE_CONFIDENCE]
-
-
-def describe(features: AudioFeatures) -> list[str]:
-    """The analysis as log lines, short enough to read in the lookup status."""
-    basics = [f"{features.bpm} BPM", features.key]
-    if features.vocals:
-        basics.append("instrumental" if features.vocals == "instrumental" else f"{features.vocals} vocals")
-    if features.loudness is not None and features.replaygain is not None:
-        basics.append(f"{features.loudness:.1f} LUFS (ReplayGain {features.replaygain:+.1f} dB)")
-    lines = [" · ".join(basics)]
-    if features.genres:
-        lines.append("genre guesses: " + ", ".join(f"{name} {probability:.0%}" for name, probability in features.genres))
-    extras = []
-    if features.moods:
-        extras.append("moods " + ", ".join(features.moods))
-    if features.instruments:
-        extras.append("instruments " + ", ".join(features.instruments))
-    for tag in ("danceability", "approachability", "engagement"):
-        if tag in features.scores:
-            extras.append(f"{tag} {features.scores[tag]:.0%}")
-    if extras:
-        lines.append(" · ".join(extras))
-    return lines
 
 
 class _Head:
@@ -260,13 +232,13 @@ class Analyzer:
     """Runs the analysis in a separate process. Essentia holds Python's global interpreter lock while it computes, so
     in a thread it froze the bot for seconds at a time, long enough for Discord to drop button clicks."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: AnalysisConfig):
         self._config = config
         self._pool: ProcessPoolExecutor | None = None
 
     @property
     def disabled_reason(self) -> str | None:
-        if not self._config.analysis_enabled:
+        if not self._config.enabled:
             return "ANALYSIS_ENABLED is off"
         if find_spec("essentia") is None:
             return "essentia-tensorflow is not installed"
@@ -282,7 +254,7 @@ class Analyzer:
         try:
             # One worker, so tracks go one at a time: TensorFlow already uses every core.
             features, device = await asyncio.get_running_loop().run_in_executor(
-                self._pool, _analyze_in_worker, config.analysis_model_dir, config.analysis_device == "cpu", audio_path
+                self._pool, _analyze_in_worker, config.model_dir, config.device == "cpu", audio_path
             )
         except BrokenProcessPool as error:
             self.close()
