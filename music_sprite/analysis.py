@@ -9,11 +9,13 @@ otherwise; ANALYSIS_DEVICE=cpu forces the CPU. Loudness (EBU R128, from which Re
 import asyncio
 import json
 import logging
+import multiprocessing
 import os
 import re
 import shutil
 import subprocess
-import threading
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import replace
 from importlib.util import find_spec
 from pathlib import Path
@@ -210,12 +212,57 @@ def _gpu_in_use() -> bool:
         return False
 
 
+# Lives in the worker process, which keeps the loaded models between tracks.
+_worker_engine: _Engine | None = None
+_worker_device_reported = False
+
+
+def _download_models(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, folder in MODEL_FILES.items():
+        target = directory / name
+        if target.exists():
+            continue
+        log.info("downloading analysis model %s", name)
+        partial = target.with_name(f"{name}.part")
+        try:
+            with httpx.stream("GET", f"{MODEL_BASE_URL}{folder}{name}", follow_redirects=True, timeout=60) as response:
+                response.raise_for_status()
+                with partial.open("wb") as file:
+                    for chunk in response.iter_bytes():
+                        file.write(chunk)
+        except httpx.HTTPError as error:
+            partial.unlink(missing_ok=True)
+            raise AnalysisError(f"could not download model {name}: {error}") from error
+        partial.replace(target)
+
+
+def _analyze_in_worker(models: Path, force_cpu: bool, audio_path: Path) -> tuple[AudioFeatures, str | None]:
+    """Runs in the worker process. Returns the features and, on the first track, the device that did the work."""
+    global _worker_engine, _worker_device_reported
+    audio = _decode(audio_path)
+    loudness, loudness_range, peak = _measure_loudness(audio_path)
+    if _worker_engine is None:
+        _download_models(models)
+        _worker_engine = _Engine(models, force_cpu)
+    try:
+        features = _worker_engine.run(audio)
+    except RuntimeError as error:
+        raise AnalysisError(f"Essentia failed: {error}") from error
+    device = None
+    if not _worker_device_reported:
+        _worker_device_reported = True
+        device = "GPU" if _gpu_in_use() else "CPU"
+    return replace(features, loudness=loudness, loudness_range=loudness_range, peak=peak), device
+
+
 class Analyzer:
+    """Runs the analysis in a separate process. Essentia holds Python's global interpreter lock while it computes, so
+    in a thread it froze the bot for seconds at a time, long enough for Discord to drop button clicks."""
+
     def __init__(self, config: Config):
         self._config = config
-        self._lock = threading.Lock()
-        self._engine: _Engine | None = None
-        self._device_logged = False
+        self._pool: ProcessPoolExecutor | None = None
 
     @property
     def disabled_reason(self) -> str | None:
@@ -228,44 +275,26 @@ class Analyzer:
         return None
 
     async def analyze(self, audio_path: Path) -> AudioFeatures:
-        return await asyncio.to_thread(self._analyze, audio_path)
+        if self._pool is None:
+            # Spawned rather than forked: forking a process that runs threads and an event loop is unsafe.
+            self._pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+        config = self._config
+        try:
+            # One worker, so tracks go one at a time: TensorFlow already uses every core.
+            features, device = await asyncio.get_running_loop().run_in_executor(
+                self._pool, _analyze_in_worker, config.analysis_model_dir, config.analysis_device == "cpu", audio_path
+            )
+        except BrokenProcessPool as error:
+            self.close()
+            raise AnalysisError("the analysis process died (out of memory?); it restarts on the next track") from error
+        if device:
+            log.info("audio analysis is running on the %s", device)
+        return features
 
-    def _analyze(self, audio_path: Path) -> AudioFeatures:
-        audio = _decode(audio_path)
-        loudness, loudness_range, peak = _measure_loudness(audio_path)
-        # One at a time: TensorFlow already uses every core, so parallel runs only compete for memory.
-        with self._lock:
-            if self._engine is None:
-                self._download_models()
-                self._engine = _Engine(self._config.analysis_model_dir, self._config.analysis_device == "cpu")
-            try:
-                features = self._engine.run(audio)
-            except RuntimeError as error:
-                raise AnalysisError(f"Essentia failed: {error}") from error
-            if not self._device_logged:
-                self._device_logged = True
-                log.info("audio analysis is running on the %s", "GPU" if _gpu_in_use() else "CPU")
-        return replace(features, loudness=loudness, loudness_range=loudness_range, peak=peak)
-
-    def _download_models(self) -> None:
-        directory = self._config.analysis_model_dir
-        directory.mkdir(parents=True, exist_ok=True)
-        for name, folder in MODEL_FILES.items():
-            target = directory / name
-            if target.exists():
-                continue
-            log.info("downloading analysis model %s", name)
-            partial = target.with_name(f"{name}.part")
-            try:
-                with httpx.stream("GET", f"{MODEL_BASE_URL}{folder}{name}", follow_redirects=True, timeout=60) as response:
-                    response.raise_for_status()
-                    with partial.open("wb") as file:
-                        for chunk in response.iter_bytes():
-                            file.write(chunk)
-            except httpx.HTTPError as error:
-                partial.unlink(missing_ok=True)
-                raise AnalysisError(f"could not download model {name}: {error}") from error
-            partial.replace(target)
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = None
 
 
 def _ffmpeg(arguments: list[str]) -> subprocess.CompletedProcess:

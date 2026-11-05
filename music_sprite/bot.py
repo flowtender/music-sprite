@@ -76,12 +76,13 @@ class MusicBot(discord.Client):
     async def setup_hook(self) -> None:
         self.http_client = httpx.AsyncClient()
         self.add_dynamic_items(*PANEL_ITEMS, *REVIEW_ITEMS)
+        self.analyzer = Analyzer(self.config)
         self.resolver = MetadataResolver(
             self.config,
             AcoustIdClient(self.http_client, self.config),
             MusicBrainzClient(self.http_client, self.config.musicbrainz_contact),
             LlmClient(self.http_client, self.config),
-            Analyzer(self.config),
+            self.analyzer,
         )
         if self.config.guild_id:
             self._register_commands(discord.Object(id=self.config.guild_id), contexts=None)
@@ -112,6 +113,7 @@ class MusicBot(discord.Client):
 
     async def close(self) -> None:
         await super().close()
+        self.analyzer.close()
         await self.http_client.aclose()
 
     async def on_ready(self) -> None:
