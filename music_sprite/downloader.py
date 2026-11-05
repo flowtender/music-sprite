@@ -1,6 +1,7 @@
 """Runs yt-dlp, and knows what its info JSON holds."""
 
 import asyncio
+import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,7 +76,8 @@ async def download(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     command = [
-        "yt-dlp",
+        # The bot's own yt-dlp and its optional dependencies (curl_cffi), not whichever one comes first on PATH.
+        sys.executable, "-m", "yt_dlp",
         "--ignore-config",
         "--force-ipv4",
         "--concurrent-fragments", "4",

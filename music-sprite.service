@@ -6,7 +6,6 @@ Wants=network-online.target
 [Service]
 User=music-sprite
 StateDirectory=music-sprite
-Environment=PATH=/opt/music-sprite/venv/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/etc/music-sprite.env
 ExecStart=/opt/music-sprite/venv/bin/music-sprite
 Restart=on-failure
