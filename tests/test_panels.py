@@ -129,6 +129,8 @@ POSTED = [
     *[(QueueAction(name, 3), f"ms:q:{name}:3", {"action": name, "page": 3}) for name in panels.QUEUE_ACTIONS],
     (review.FieldSelect("abcd1234", "album_artist", OPTIONS), "ms:r:field:abcd1234:album_artist",
      {"entry_id": "abcd1234", "name": "album_artist"}),
+    (review.FieldPick("abcd1234", "title", "llm", "Low Tide", "✨", True), "ms:r:pick:abcd1234:title:llm",
+     {"entry_id": "abcd1234", "name": "title", "source": "llm"}),
     (review.ReleaseSelect("abcd1234", OPTIONS), "ms:r:release:abcd1234", {"entry_id": "abcd1234"}),
     *[(review.ReviewAction(name, "abcd1234"), f"ms:r:{name}:abcd1234", {"action": name, "entry_id": "abcd1234"})
       for name in review.REVIEW_ACTIONS],

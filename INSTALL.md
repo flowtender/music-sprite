@@ -45,6 +45,7 @@ sudo systemctl enable --now music-sprite
 ```bash
 journalctl -u music-sprite -f
 ```
+On its first start the bot uploads the source emojis in `music_sprite/assets/` (MusicBrainz, Essentia, the LLM, YouTube, SoundCloud, Bandcamp) as application emojis; the log says `uploaded the emoji ...` for each. A site's emoji is named after its yt-dlp extractor, so adding e.g. `mixcloud.png` (PNG, at most 256 KB) and reinstalling with `pip install .` covers Mixcloud too. Emojis are matched by name and never replaced: to change an image, delete its emoji under *Emojis* in the Discord Developer Portal, then restart.
 
 # GPU analysis (optional)
 The analysis models run on the CPU by default and take a few seconds per track; a GPU only speeds up the neural-network part, so the gain is modest (on an RTX 3060 about 2.6 s against 3.4 s per track, after a slower first run while CUDA starts up). The `essentia-tensorflow` wheel is built for CUDA 11.2 and cuDNN 8.1, which still support Pascal cards such as the GTX 1060. It needs the NVIDIA driver plus those two libraries; conda is the easiest way to get them without touching the system:

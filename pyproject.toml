@@ -24,6 +24,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["music_sprite"]
+package-data = { music_sprite = ["assets/*.png"] }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

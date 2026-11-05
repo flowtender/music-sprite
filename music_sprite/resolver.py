@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import describe, heuristics
@@ -28,7 +28,6 @@ ProgressCallback = Callable[[list[str], list[str]], Awaitable[None]]
 class Resolution:
     findings: Findings
     unavailable_services: list[str]
-    steps: list[str] = field(default_factory=list)
 
 
 class _Steps:
@@ -130,7 +129,7 @@ class MetadataResolver:
             upload=draft, releases=_rank(identified.result(), info.get("duration")), audio=analysis.result()
         )
         findings.llm = await self._ask_llm(info, findings, steps)
-        return Resolution(findings, steps.unreachable, steps.lines)
+        return Resolution(findings, steps.unreachable)
 
     async def _identify(self, audio_path: Path, draft: TrackMetadata, steps: _Steps) -> list[TrackMetadata]:
         """The recording by its fingerprint, then everything MusicBrainz knows about it."""

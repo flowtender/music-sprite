@@ -133,10 +133,14 @@ class ThrottledStatus:
 
 @dataclass
 class Unit:
-    """One piece of a long card: its text, then optionally the drop-down that belongs to it."""
+    """One piece of a long card: its text, then optionally the row of controls (a drop-down or buttons) for it."""
 
     text: str
-    select: ActionRow | None = None
+    row: ActionRow | None = None
+
+    @property
+    def interactive(self) -> int:
+        return len(self.row.children) if self.row else 0
 
 
 class _Page:
@@ -148,20 +152,20 @@ class _Page:
         self.interactive = 0
 
     def fits(self, unit: Unit) -> bool:
-        components = self.components + (0 if self._lines else 1) + (2 if unit.select else 0)
+        components = self.components + (0 if self._lines else 1) + (1 + unit.interactive if unit.row else 0)
         text = self.text + len(unit.text) + (1 if self._lines else 0)
-        interactive = self.interactive + (1 if unit.select else 0)
+        interactive = self.interactive + unit.interactive
         return components <= MAX_COMPONENTS and text <= MAX_TEXT and interactive <= MAX_INTERACTIVE
 
     def add(self, unit: Unit) -> None:
         self.components += 0 if self._lines else 1
         self.text += len(unit.text) + (1 if self._lines else 0)
         self._lines.append(unit.text)
-        if unit.select:
+        if unit.row:
             self.flush()
-            self.children.append(unit.select)
-            self.components += 2
-            self.interactive += 1
+            self.children.append(unit.row)
+            self.components += 1 + unit.interactive
+            self.interactive += unit.interactive
 
     def flush(self) -> None:
         if self._lines:

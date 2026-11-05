@@ -17,7 +17,7 @@ class TestResolveEntry:
         entry = make_entry()
         run(make_pipeline().resolve_entry(entry))
         saved = staging.get(entry.id)
-        assert (saved.status, saved.resolve_error, saved.resolve_steps) == (EntryStatus.RESOLVED, None, ["Upload: found"])
+        assert (saved.status, saved.resolve_error) == (EntryStatus.RESOLVED, None)
         assert saved.meta.album == "Album 0"
 
     def test_an_unavailable_service_leaves_the_entry_partial(self, make_pipeline, resolver, make_entry):

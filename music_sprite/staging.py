@@ -36,7 +36,6 @@ class QueueEntry:
     created_at: str
     status: EntryStatus = EntryStatus.PENDING
     resolve_error: str | None = None
-    resolve_steps: list[str] = field(default_factory=list)
     findings: Findings | None = None
     choices: Choices = field(default_factory=Choices)
     meta: TrackMetadata | None = None
@@ -140,7 +139,6 @@ class QueueEntry:
             "created_at": self.created_at,
             "status": self.status,
             "resolve_error": self.resolve_error,
-            "resolve_steps": self.resolve_steps,
             "findings": self.findings.to_dict() if self.findings else None,
             "choices": self.choices.to_dict(),
             "meta": self.meta.to_dict() if self.meta else None,
@@ -157,7 +155,8 @@ class QueueEntry:
         choices = data.pop("choices", None)
         status = EntryStatus(data.pop("status", EntryStatus.PENDING))
         # Entries saved before lookups kept their findings: the tags they had become the one source they now have.
-        for legacy_key in ("edited", "candidates", "candidate_index"):
+        # Entries saved before the review card stopped showing the lookup log still carry it (resolve_steps).
+        for legacy_key in ("edited", "candidates", "candidate_index", "resolve_steps"):
             data.pop(legacy_key, None)
         return cls(
             directory=directory,

@@ -1,12 +1,15 @@
-"""The per-track review card: every field the sources found, a drop-down wherever they disagree, and the buttons.
+"""The per-track review card: every field with the value each source gave, buttons wherever they disagree, and the
+actions.
 
-Every interactive item is a DynamicItem whose custom_id carries what it needs (queue entry id, field), and the state
-itself lives in the queue entry on disk, so the card keeps working after the bot restarts.
+Each value is followed by the emoji of every source that gave it (emojis.py); a field whose sources disagree shows
+the value that will be tagged first and the other sources' values after it. Every interactive item is a DynamicItem
+whose custom_id carries what it needs (queue entry id, field, source), and the state itself lives in the queue entry
+on disk, so the card keeps working after the bot restarts.
 
 A message holds at most 40 components (30 of them interactive) and 4000 characters of text, and a track with credits
-and a long lookup log needs more than that, so the card is split over several messages. Fields are packed in order;
-the buttons sit on the last message, where the chat ends. Choosing something changes more than one field (a release
-brings its album, date, label, ...), so every message of the card is re-rendered after each choice.
+and a long upload description needs more than that, so the card is split over several messages. Fields are packed in
+order; the buttons sit on the last message, where the chat ends. Choosing something changes more than one field (a
+release brings its album, date, label, ...), so every message of the card is re-rendered after each choice.
 """
 
 import re
@@ -15,12 +18,12 @@ import discord
 from discord.ui import ActionRow, Button, DynamicItem, LayoutView, Section, Select, Separator, TextDisplay, Thumbnail
 
 from . import describe
-from .models import SOURCE_LABELS, AudioFeatures, TrackMetadata
-from .reconcile import CHOOSABLE_FIELDS, FIELDS, RELEASE_FIELDS, Candidate, FieldReport, Reconciled
+from .emojis import Emojis
+from .models import AudioFeatures, LlmVerdict, TrackMetadata
+from .reconcile import CHOOSABLE_FIELDS, FIELDS, RELEASE, RELEASE_FIELDS, Candidate, FieldReport, Reconciled
 from .staging import QueueEntry
 from .ui import (
     MAX_SELECT_OPTIONS,
-    STEP_MAX_CHARS,
     STYLE,
     AllowedUsersOnly,
     Unit,
@@ -42,7 +45,12 @@ from .ui import (
 PAGE_TAG_MARGIN = 40
 UNIT_MAX_CHARS = 1500
 MAX_SHOWN_RELEASES = 6
-DESCRIPTION_CHARS = 600
+# A description the LLM didn't read is only context for the reader, so a preview does.
+DESCRIPTION_PREVIEW_CHARS = 600
+# Description lines are cut this short before escaping, which can double their length, so one fits in a unit.
+DESCRIPTION_PIECE_CHARS = 600
+MAX_BUTTON_LABEL = 80
+REASONING_CHARS = 300
 
 REVIEW_ACTIONS = {
     "approve": ("Approve", STYLE.success),
@@ -53,23 +61,37 @@ REVIEW_ACTIONS = {
 ACTIONS_COMPONENTS = 1 + 1 + len(REVIEW_ACTIONS)  # separator, row, buttons
 LABELS = {"title": "Title", "artist": "Artist", "album": "Album", "album_artist": "Album artist", "year": "Year"}
 CHOSEN, OTHER = "✅", "▫️"
+EDITED = "✏️"
+# Between the value that will be tagged and those of the sources that disagree with it.
+DISAGREES = " ≠ "
+
+Marks = dict[str, str]  # source -> its emoji, as message markup
 
 
-def _field(label: str, value: object) -> str:
+def _value(value: object, limit: int = UNIT_MAX_CHARS) -> str:
     shown = ", ".join(map(str, value)) if isinstance(value, (list, tuple)) else value
-    return f"**{label}:** {escape(shown) if shown not in (None, '') else '*none*'}"
+    return escape(truncate(str(shown), limit)) if shown not in (None, "") else "*none*"
 
 
-def _optional_field(label: str, value: object) -> str | None:
+def _found(value: object) -> bool:
+    return value not in (None, "", [], ())
+
+
+def _field(label: str, value: object, mark: str = "") -> str:
+    """A field line; `mark` is the emoji of the source the value came from."""
+    return f"**{label}:** {_value(value)}" + (f" {mark}" if mark and _found(value) else "")
+
+
+def _optional_field(label: str, value: object, mark: str = "") -> str | None:
     """A field line, or nothing when no source has a value; the optional details list only what was found."""
-    return _field(label, value) if value not in (None, "", [], ()) else None
+    return _field(label, value, mark) if _found(value) else None
 
 
-def _sources(candidate: Candidate) -> str:
-    return ", ".join(SOURCE_LABELS[source] for source in candidate.sources)
+def _mark(candidate: Candidate, marks: Marks) -> str:
+    return "".join(marks[source] for source in candidate.sources)
 
 
-# --- drop-downs -----------------------------------------------------------------------------------------------
+# --- buttons and drop-downs for the choices -------------------------------------------------------------------
 
 
 async def gone(interaction: discord.Interaction) -> None:
@@ -83,7 +105,44 @@ async def _choice_made(interaction: discord.Interaction, entry: QueueEntry) -> N
     await bot.sync_review(entry)
 
 
+async def _pick_field(interaction: discord.Interaction, entry_id: str, name: str, source: str) -> None:
+    entry = bot_of(interaction).staging.get(entry_id)
+    if entry is None or not entry.pick_field(name, source):
+        await gone(interaction)
+        return
+    await _choice_made(interaction, entry)
+
+
+class FieldPick(
+    AllowedUsersOnly, DynamicItem[Button], template=r"ms:r:pick:(?P<id>\w+):(?P<field>\w+):(?P<source>\w+)"
+):
+    """One of the values the sources disagree on; the current choice is highlighted."""
+
+    def __init__(self, entry_id: str, name: str, source: str, label: str | None, emoji, chosen: bool):
+        super().__init__(
+            Button(
+                label=label,
+                emoji=emoji,
+                style=STYLE.primary if chosen else STYLE.secondary,
+                custom_id=f"ms:r:pick:{entry_id}:{name}:{source}",
+            )
+        )
+        self.entry_id = entry_id
+        self.name = name
+        self.source = source
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: Button, match: re.Match[str]):
+        button = unwrap(item)
+        return cls(match["id"], match["field"], match["source"], button.label, button.emoji, button.style == STYLE.primary)
+
+    async def callback(self, interaction: discord.Interaction):
+        await _pick_field(interaction, self.entry_id, self.name, self.source)
+
+
 class FieldSelect(AllowedUsersOnly, DynamicItem[Select], template=r"ms:r:field:(?P<id>\w+):(?P<field>\w+)"):
+    """The drop-down that FieldPick replaced. Cards posted before still have it; a pick re-renders them with buttons."""
+
     def __init__(self, entry_id: str, name: str, options: list[discord.SelectOption]):
         super().__init__(
             Select(
@@ -102,11 +161,7 @@ class FieldSelect(AllowedUsersOnly, DynamicItem[Select], template=r"ms:r:field:(
         return cls(match["id"], match["field"], unwrap(item).options)
 
     async def callback(self, interaction: discord.Interaction):
-        entry = bot_of(interaction).staging.get(self.entry_id)
-        if entry is None or not entry.pick_field(self.name, interaction.data["values"][0]):
-            await gone(interaction)
-            return
-        await _choice_made(interaction, entry)
+        await _pick_field(interaction, self.entry_id, self.name, interaction.data["values"][0])
 
 
 class ReleaseSelect(AllowedUsersOnly, DynamicItem[Select], template=r"ms:r:release:(?P<id>\w+)"):
@@ -134,17 +189,21 @@ class ReleaseSelect(AllowedUsersOnly, DynamicItem[Select], template=r"ms:r:relea
         await _choice_made(interaction, entry)
 
 
-def _field_select(entry_id: str, report: FieldReport) -> ActionRow:
-    options = [
-        discord.SelectOption(
-            label=truncate(str(candidate.value), 100),
-            value=candidate.sources[0],
-            description=truncate(_sources(candidate), 100),
-            default=index == report.chosen and not report.manual,
+def _field_buttons(entry_id: str, report: FieldReport, marks: Marks) -> ActionRow:
+    # At most one button per source (MusicBrainz, LLM, upload), so they fit the row's five.
+    return ActionRow(
+        *(
+            FieldPick(
+                entry_id,
+                report.name,
+                candidate.sources[0],
+                truncate(str(candidate.value), MAX_BUTTON_LABEL),
+                marks[candidate.sources[0]],
+                index == report.chosen and not report.manual,
+            )
+            for index, candidate in enumerate(report.candidates)
         )
-        for index, candidate in enumerate(report.candidates)
-    ]
-    return ActionRow(FieldSelect(entry_id, report.name, options))
+    )
 
 
 def _release_select(entry_id: str, reconciled: Reconciled) -> ActionRow:
@@ -163,42 +222,26 @@ def _release_select(entry_id: str, reconciled: Reconciled) -> ActionRow:
 # --- the fields -----------------------------------------------------------------------------------------------
 
 
-def _field_unit(entry: QueueEntry, report: FieldReport, final: object) -> Unit:
-    label = LABELS[report.name]
-    if report.conflicted:
-        heading = (
-            f"{_field(label, final)} ✏️ edited by hand · the sources disagree:"
-            if report.manual
-            else f"**{label}** · the sources disagree, pick one:"
-        )
-        lines = [heading]
-        for index, candidate in enumerate(report.candidates):
-            mark = CHOSEN if index == report.chosen and not report.manual else OTHER
-            lines.append(f"{mark} {escape(truncate(str(candidate.value), 200))} *({_sources(candidate)})*")
-        return Unit("\n".join(lines), _field_select(entry.id, report))
-
-    text = _field(label, final)
-    if report.manual:
-        text += " ✏️ edited by hand"
-    elif report.chosen is not None:
-        text += f" *({_sources(report.candidates[report.chosen])})*"
-    if len(report.candidates) > 1:
-        # The release decides this field, so the other sources' values are shown only for comparison.
-        others = [
-            f"{escape(truncate(str(candidate.value), 100))} ({_sources(candidate)})"
-            for index, candidate in enumerate(report.candidates)
-            if index != report.chosen
-        ]
-        text += "\n-# other sources: " + ", ".join(others)
-    return Unit(text)
+def _field_unit(entry_id: str, report: FieldReport, final: object, marks: Marks) -> Unit:
+    """The value that will be tagged with its sources (or as edited by hand), then every other source's value."""
+    chosen = next((candidate for candidate in report.candidates if candidate.value == final), None)
+    mark = EDITED if report.manual else _mark(chosen, marks) if chosen else ""
+    shown = [_value(final, 200) + (f" {mark}" if mark else "")]
+    shown += [
+        f"{_value(candidate.value, 100)} {_mark(candidate, marks)}"
+        for candidate in report.candidates
+        if candidate is not chosen
+    ]
+    text = f"**{LABELS[report.name]}:** " + DISAGREES.join(shown)
+    return Unit(text, _field_buttons(entry_id, report, marks) if report.conflicted else None)
 
 
-def _release_unit(entry: QueueEntry, reconciled: Reconciled) -> Unit | None:
+def _release_unit(entry_id: str, reconciled: Reconciled, llm_pick: object, marks: Marks) -> Unit | None:
     """The choice between equally good releases; a single match needs no choice and shows up in the details."""
     if not reconciled.release_conflicted:
         return None
     releases = reconciled.releases
-    lines = [f"**Release** · {len(releases)} equally good matches, pick one:"]
+    lines = [f"**Release** {marks['musicbrainz']} · {len(releases)} equally good matches, pick one:"]
     for index, option in enumerate(releases[:MAX_SHOWN_RELEASES]):
         date = option.release.release_date or option.year
         position = describe.track_position(option)
@@ -210,27 +253,35 @@ def _release_unit(entry: QueueEntry, reconciled: Reconciled) -> Unit | None:
             option.release.country,
         ]
         album = escape(truncate(describe.release_name(option), 120))
-        lines.append(f"{CHOSEN if index == reconciled.release_index else OTHER} **{album}**" + (f" ({date})" if date else ""))
+        lines.append(
+            f"{CHOSEN if index == reconciled.release_index else OTHER} **{album}**"
+            + (f" ({date})" if date else "")
+            + (f" {marks['llm']}" if index == llm_pick else "")
+        )
         lines.append("-# " + escape(" · ".join(extra for extra in extras if extra)))
     hidden = len(releases) - MAX_SHOWN_RELEASES
     if hidden > 0:
         lines.append(f"-# …and {hidden} more in the drop-down")
-    return Unit("\n".join(lines), _release_select(entry.id, reconciled))
+    return Unit("\n".join(lines), _release_select(entry_id, reconciled))
 
 
-def _release_details(meta: TrackMetadata) -> str:
+def _release_details(meta: TrackMetadata, mark: str) -> str:
     release = meta.release
     lines = [
-        _optional_field("Release date", release.release_date),
-        _optional_field("Original date", release.original_date if release.original_date != release.release_date else None),
-        _optional_field("Track", describe.track_position(meta)),
-        _optional_field("Label", describe.label(meta)),
-        _optional_field("Barcode", release.barcode),
-        _optional_field("Country", release.country),
-        _optional_field("Release type", " / ".join(filter(None, [*release.types, release.status, release.media_format]))),
-        _optional_field("Language", " · ".join(filter(None, [release.language, release.script]))),
-        _optional_field("ISRC", release.isrcs),
-        _optional_field("ISWC", release.iswcs),
+        _optional_field("Release date", release.release_date, mark),
+        _optional_field(
+            "Original date", release.original_date if release.original_date != release.release_date else None, mark
+        ),
+        _optional_field("Track", describe.track_position(meta), mark),
+        _optional_field("Label", describe.label(meta), mark),
+        _optional_field("Barcode", release.barcode, mark),
+        _optional_field("Country", release.country, mark),
+        _optional_field(
+            "Release type", " / ".join(filter(None, [*release.types, release.status, release.media_format])), mark
+        ),
+        _optional_field("Language", " · ".join(filter(None, [release.language, release.script])), mark),
+        _optional_field("ISRC", release.isrcs, mark),
+        _optional_field("ISWC", release.iswcs, mark),
     ]
     if meta.musicbrainz:
         ids = meta.musicbrainz
@@ -247,13 +298,32 @@ def _release_details(meta: TrackMetadata) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def _credits_unit(meta: TrackMetadata) -> str:
+def _genres_field(reconciled: Reconciled, edited: bool, marks: Marks) -> str:
+    """Every source's genres, grouped by the sources that gave them; Essentia's with how sure it is."""
+    if edited:
+        return _field("Genres", reconciled.metadata.genres, EDITED)
+    audio = reconciled.metadata.audio
+    probabilities = dict(audio.genres) if audio else {}
+    groups: list[tuple[list[str], str]] = []
+    for candidate in reconciled.genres:
+        name = escape(candidate.value)
+        if "essentia" in candidate.sources and candidate.value in probabilities:
+            name += f" {probabilities[candidate.value]:.0%}"
+        mark = _mark(candidate, marks)
+        if groups and groups[-1][1] == mark:
+            groups[-1][0].append(name)
+        else:
+            groups.append(([name], mark))
+    return "**Genres:** " + (" · ".join(f"{', '.join(names)} {mark}" for names, mark in groups) or "*none*")
+
+
+def _credits_unit(meta: TrackMetadata, mark: str) -> str:
     return "\n".join(
-        _field(role.capitalize(), truncate(", ".join(names), 300)) for role, names in meta.release.credits.items()
+        _field(role.capitalize(), truncate(", ".join(names), 300), mark) for role, names in meta.release.credits.items()
     )
 
 
-def _audio_unit(audio: AudioFeatures | None) -> str:
+def _audio_unit(audio: AudioFeatures | None, mark: str) -> str:
     if audio is None:
         return _field("Audio analysis", None)
     loudness = describe.loudness(audio)
@@ -262,62 +332,91 @@ def _audio_unit(audio: AudioFeatures | None) -> str:
     if loudness and audio.peak is not None:
         loudness += f" · peak {audio.peak:.2f}"
     lines = [
-        _field("BPM", audio.bpm),
-        _field("Key", audio.key),
-        _optional_field("Vocals", describe.vocals(audio)),
-        _optional_field("Genre guesses", [f"{name} {probability:.0%}" for name, probability in audio.genres]),
-        _optional_field("Moods", audio.moods),
-        _optional_field("Instruments", audio.instruments),
-        _optional_field("Scores", [f"{name} {score:.0%}" for name, score in audio.scores.items()]),
-        _optional_field("Loudness", loudness),
+        _field("BPM", audio.bpm, mark),
+        _field("Key", audio.key, mark),
+        _optional_field("Vocals", describe.vocals(audio), mark),
+        _optional_field("Moods", audio.moods, mark),
+        _optional_field("Instruments", audio.instruments, mark),
+        _optional_field("Scores", describe.headline_scores(audio), mark),
+        _optional_field("Loudness", loudness, mark),
     ]
     return "\n".join(line for line in lines if line)
 
 
-def _description_unit(info: dict) -> Unit | None:
-    description = (info.get("description") or "").strip()
-    if not description:
+def _description_units(info: dict, read_by_llm: bool, llm_chars: int, mark: str) -> list[Unit]:
+    """The upload's description. The LLM reads it, so a prompt injection would hide there: when the LLM was asked,
+    all of what it read is shown, which can take more than one unit."""
+    description = info.get("description") or ""
+    if read_by_llm:
+        shown = description[:llm_chars] + ("…" if len(description) > llm_chars else "")  # as llm.trim_upload cuts it
+        heading = f"{mark} **Upload description** · the LLM read this, so check it for prompt injection"
+    else:
+        shown = truncate(description, DESCRIPTION_PREVIEW_CHARS)
+        heading = f"{mark} **Upload description**"
+    shown = shown.strip()
+    if not shown:
+        return []
+    units: list[Unit] = []
+    lines, length = [heading], len(heading)
+    for line in shown.splitlines():
+        for start in range(0, max(len(line), 1), DESCRIPTION_PIECE_CHARS):
+            quoted = "> " + escape(line[start : start + DESCRIPTION_PIECE_CHARS])
+            if length + 1 + len(quoted) > UNIT_MAX_CHARS:
+                units.append(Unit("\n".join(lines)))
+                lines, length = [], -1
+            lines.append(quoted)
+            length += 1 + len(quoted)
+    units.append(Unit("\n".join(lines)))
+    return units
+
+
+def _llm_line(verdict: LlmVerdict | None, mark: str) -> str | None:
+    if verdict is None:
         return None
-    quoted = "\n".join(f"> {line}" for line in escape(truncate(description, DESCRIPTION_CHARS)).splitlines())
-    return Unit(f"**Upload description** *(the LLM reads all of it, so check it for anything odd)*\n{quoted}")
+    reasoning = escape(truncate(verdict.reasoning, REASONING_CHARS)) if verdict.reasoning else "no reasoning given"
+    return (
+        f"-# {mark} {escape(verdict.model)}, asked about {', '.join(verdict.asked)}: {reasoning}"
+        f" · confidence {verdict.confidence:.0%}"
+    )
 
 
-def build_units(entry: QueueEntry, reconciled: Reconciled) -> list[Unit]:
+def build_units(entry: QueueEntry, reconciled: Reconciled, marks: Marks, llm_description_chars: int) -> list[Unit]:
     meta = reconciled.metadata
+    llm = entry.findings.llm if entry.findings else None
     units: list[Unit] = []
 
-    def add(text: str | None, select: ActionRow | None = None) -> None:
+    def add(text: str | None) -> None:
         if text:
-            units.append(Unit(truncate(text, UNIT_MAX_CHARS), select))
+            units.append(Unit(truncate(text, UNIT_MAX_CHARS)))
 
     values = {name: getattr(meta, name) for name in FIELDS}
     if entry.resolve_error:
         add(f"⚠️ {escape(entry.resolve_error)}")
     for name in CHOOSABLE_FIELDS:
-        units.append(_field_unit(entry, reconciled.fields[name], values[name]))
-    if release := _release_unit(entry, reconciled):
+        units.append(_field_unit(entry.id, reconciled.fields[name], values[name], marks))
+    if release := _release_unit(entry.id, reconciled, llm.answers.get(RELEASE) if llm else None, marks):
         units.append(release)
     for name in RELEASE_FIELDS:
         report = reconciled.fields[name]
         if name == "album_artist" and not report.candidates and not report.manual:
             continue
-        units.append(_field_unit(entry, report, values[name]))
-    add(_release_details(meta))
-    add(_field("Genres", meta.genres))
-    add(_credits_unit(meta))
-    add(_audio_unit(meta.audio))
-    if description := _description_unit(entry.info):
-        units.append(description)
-    for step in entry.resolve_steps:
-        add(f"-# {escape(truncate(step, STEP_MAX_CHARS))}")
+        units.append(_field_unit(entry.id, report, values[name], marks))
+    add(_release_details(meta, marks["musicbrainz"]))
+    add(_genres_field(reconciled, "genres" in entry.choices.manual, marks))
+    add(_credits_unit(meta, marks["musicbrainz"]))
+    add(_audio_unit(meta.audio, marks["essentia"]))
+    units.extend(_description_units(entry.info, llm is not None, llm_description_chars, marks["upload"]))
+    add(_llm_line(llm, marks["llm"]))
     return units
 
 
-def build_review_pages(entry: QueueEntry) -> list[LayoutView]:
-    """The card's messages, first to last. The entry needs findings (QueueEntry.ensure_findings)."""
+def build_review_pages(entry: QueueEntry, emojis: Emojis, llm_description_chars: int) -> list[LayoutView]:
+    """The card's messages, first to last. The entry needs findings (QueueEntry.ensure_findings).
+    `llm_description_chars` is how much of the upload description the LLM reads (LlmConfig.description_chars)."""
     reconciled = entry.reconcile()
     assert reconciled is not None, "the entry has no findings"
     meta = reconciled.metadata
+    marks = emojis.sources(entry.info)
 
     title = f"### {escape(meta.title)}"
     thumbnail_url = entry.info.get("thumbnail")
@@ -338,7 +437,7 @@ def build_review_pages(entry: QueueEntry) -> list[LayoutView]:
     first_components = 1 + (3 if thumbnail_url else 1) + (1 if note else 0)
     first_text = len(header_text) + len(note or "") + PAGE_TAG_MARGIN
     pages = paginate(
-        build_units(entry, reconciled),
+        build_units(entry, reconciled, marks, llm_description_chars),
         first_components,
         first_text,
         2,
@@ -442,4 +541,4 @@ class EditModal(discord.ui.Modal, title="Edit metadata"):
         await _choice_made(interaction, self.entry)
 
 
-DYNAMIC_ITEMS = (ReviewAction, FieldSelect, ReleaseSelect)
+DYNAMIC_ITEMS = (ReviewAction, FieldPick, FieldSelect, ReleaseSelect)

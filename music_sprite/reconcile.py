@@ -55,6 +55,7 @@ class Reconciled:
     fields: dict[str, FieldReport]
     releases: list[TrackMetadata]
     release_index: int | None
+    genres: list[Candidate]  # every source's genres combined, strongest source first, each with its sources
 
     @property
     def release_conflicted(self) -> bool:
@@ -117,17 +118,14 @@ def _report(name: str, pairs: list[tuple[str, object]], choices: Choices, *, sel
     return FieldReport(name, candidates, chosen, selectable and len(candidates) > 1, name in choices.manual)
 
 
-def _genres(selected: TrackMetadata | None, findings: Findings) -> list[str]:
-    combined: dict[str, str] = {}
-    sources = [
-        selected.genres if selected else [],
-        findings.audio.confident_genres if findings.audio else [],
-        findings.upload.genres,
-    ]
-    for genres in sources:
-        for genre in genres:
-            combined.setdefault(_fold(genre), genre)
-    return list(combined.values())
+def _genres(selected: TrackMetadata | None, findings: Findings) -> list[Candidate]:
+    return _group(
+        [
+            *(("musicbrainz", genre) for genre in (selected.genres if selected else [])),
+            *(("essentia", genre) for genre in (findings.audio.confident_genres if findings.audio else [])),
+            *(("upload", genre) for genre in findings.upload.genres),
+        ]
+    )
 
 
 def _candidate_confidence(candidate: Candidate, selected: TrackMetadata | None, findings: Findings) -> float:
@@ -176,6 +174,7 @@ def reconcile(findings: Findings, choices: Choices) -> Reconciled:
     else:
         origin = findings.upload.origin
 
+    genres = _genres(selected, findings)
     metadata = replace(
         base,
         title=title,
@@ -183,7 +182,7 @@ def reconcile(findings: Findings, choices: Choices) -> Reconciled:
         album=value("album"),
         album_artist=value("album_artist"),
         year=value("year") if isinstance(value("year"), int) else None,
-        genres=_genres(selected, findings),
+        genres=[candidate.value for candidate in genres],
         confidence=confidence,
         origin=origin,
         from_known_publisher=findings.upload.from_known_publisher,
@@ -191,7 +190,7 @@ def reconcile(findings: Findings, choices: Choices) -> Reconciled:
     )
     if choices.manual:
         metadata = replace(metadata, origin=f"{origin}+edited", **choices.manual)
-    return Reconciled(metadata, reports, findings.releases, index)
+    return Reconciled(metadata, reports, findings.releases, index, genres)
 
 
 def settled(findings: Findings) -> Reconciled:

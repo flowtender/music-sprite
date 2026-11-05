@@ -99,7 +99,6 @@ def test_the_llm_is_skipped_when_nothing_is_ambiguous():
     info = {**INFO, "artist": "Tidal Pools", "track": "Low Tide"}  # source tags: confidence 0.9, matches MusicBrainz
     resolution, requests = resolve(info=info)
     assert requests == [] and resolution.findings.llm is None
-    assert any(step.startswith("LLM: skipped") for step in resolution.steps)
 
 
 def test_the_llm_is_asked_only_about_ambiguous_fields_and_cannot_override_the_rest():

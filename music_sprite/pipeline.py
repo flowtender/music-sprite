@@ -103,7 +103,6 @@ class Pipeline:
             entry.resolve_error = "Lookup crashed; see the service log."
         else:
             entry.set_findings(resolution.findings)
-            entry.resolve_steps = resolution.steps
             unavailable = resolution.unavailable_services
             entry.status = EntryStatus.PARTIAL if unavailable else EntryStatus.RESOLVED
             entry.resolve_error = f"{', '.join(unavailable)} unavailable; use Re-lookup later" if unavailable else None

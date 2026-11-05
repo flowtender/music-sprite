@@ -10,6 +10,7 @@ import discord
 import httpx
 from discord import app_commands
 
+from . import emojis
 from .acoustid import AcoustIdClient
 from .analysis import Analyzer
 from .config import Config
@@ -56,6 +57,7 @@ class MusicBot(discord.Client):
         self.http_client: httpx.AsyncClient
         self.analyzer: Analyzer
         self.pipeline: Pipeline
+        self.app_emojis = emojis.Emojis()  # discord.Client.emojis is the guilds' emojis
 
     def is_allowed(self, user_id: int) -> bool:
         return user_id in self.config.discord.allowed_user_ids
@@ -63,6 +65,10 @@ class MusicBot(discord.Client):
     async def setup_hook(self) -> None:
         self.http_client = httpx.AsyncClient()
         self.add_dynamic_items(*PANEL_ITEMS, *REVIEW_ITEMS)
+        try:
+            self.app_emojis = await emojis.sync(self)
+        except discord.HTTPException:
+            log.warning("could not load the application's emojis; the review card uses plain ones", exc_info=True)
         self.analyzer = Analyzer(self.config.analysis)
         lookup = self.config.lookup
         resolver = MetadataResolver(
@@ -188,7 +194,7 @@ class MusicBot(discord.Client):
 
     def _review_pages(self, entry: QueueEntry) -> list[discord.ui.LayoutView]:
         entry.ensure_findings(self.config.lookup.known_publishers)
-        return build_review_pages(entry)
+        return build_review_pages(entry, self.app_emojis, self.config.llm.description_chars)
 
     async def publish_review(
         self,

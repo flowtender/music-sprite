@@ -54,7 +54,7 @@ def upload(title="Low Tide", artist="Tidal Pools", confidence=0.9, **kwargs) -> 
 def resolution(*, releases=1, unavailable=()) -> Resolution:
     """What a lookup returns: the upload's own tags plus `releases` tied MusicBrainz matches."""
     matches = [release(album=f"Album {i}", recording=f"r{i}") for i in range(releases)]
-    return Resolution(Findings(upload=upload(), releases=matches), list(unavailable), ["Upload: found"])
+    return Resolution(Findings(upload=upload(), releases=matches), list(unavailable))
 
 
 def llm_config(**overrides) -> LlmConfig:

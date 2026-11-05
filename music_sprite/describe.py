@@ -3,6 +3,8 @@
 from .models import AudioFeatures, TrackMetadata
 
 MAX_LOGGED_CREDITS = 3
+# The analysis scores worth a glance, on the card and in the lookup log; all of them are tagged.
+HEADLINE_SCORES = ("danceability", "approachability", "engagement")
 
 
 def artist_title(meta: TrackMetadata) -> str:
@@ -46,6 +48,10 @@ def loudness(audio: AudioFeatures) -> str | None:
     if audio.loudness is None or audio.replaygain is None:
         return None
     return f"{audio.loudness:.1f} LUFS · ReplayGain {audio.replaygain:+.1f} dB"
+
+
+def headline_scores(audio: AudioFeatures) -> list[str]:
+    return [f"{tag} {audio.scores[tag]:.0%}" for tag in HEADLINE_SCORES if tag in audio.scores]
 
 
 # --- the lookup log: one line per fact, short enough to follow while it runs ------------------------------------
@@ -101,9 +107,7 @@ def audio_lines(features: AudioFeatures) -> list[str]:
         extras.append("moods " + ", ".join(features.moods))
     if features.instruments:
         extras.append("instruments " + ", ".join(features.instruments))
-    for tag in ("danceability", "approachability", "engagement"):
-        if tag in features.scores:
-            extras.append(f"{tag} {features.scores[tag]:.0%}")
+    extras.extend(headline_scores(features))
     if extras:
         lines.append(" · ".join(extras))
     return lines
