@@ -13,6 +13,7 @@ dependencies = [
 [project.optional-dependencies]
 # Tempo, key and genre analysis of the audio (about 300 MB with TensorFlow)
 analysis = ["essentia-tensorflow"]
+test = ["pytest"]
 
 [project.scripts]
 music-sprite = "music_sprite.__main__:main"
@@ -23,3 +24,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["music_sprite"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
