@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from dataclasses import replace
 from difflib import SequenceMatcher
 
@@ -20,6 +21,8 @@ MIN_SEARCH_SCORE = 90
 MIN_TEXT_SIMILARITY = 0.85
 DURATION_TOLERANCE_SECONDS = 15
 REQUEST_SPACING_SECONDS = 1.1
+CACHE_SECONDS = 600
+CACHE_ENTRIES = 64
 MAX_GENRES = 5
 MAX_CREDITS_PER_ROLE = 50
 
@@ -134,6 +137,7 @@ class MusicBrainzClient:
         self._http = http
         self._user_agent = f"music-sprite/0.1 ({contact or 'no-contact'})"
         self._lock = asyncio.Lock()
+        self._cache: dict[tuple, tuple[float, dict]] = {}
 
     async def enrich(self, draft: TrackMetadata, duration_seconds: float | None) -> list[TrackMetadata]:
         """Returns every recording that matches at the best search score, with full details."""
@@ -154,30 +158,48 @@ class MusicBrainzClient:
     async def fetch_recording(
         self, recording_id: str, draft: TrackMetadata, confidence: float, origin: str
     ) -> TrackMetadata:
-        recording = await self._get(f"{RECORDING_URL}/{recording_id}", {"inc": RECORDING_INC})
+        recording = await self._get_cached(f"{RECORDING_URL}/{recording_id}", {"inc": RECORDING_INC})
         stub = self._pick_release(recording.get("releases") or [])
-        release = await self._get(f"{RELEASE_URL}/{stub['id']}", {"inc": RELEASE_INC}) if stub else {}
+        release = await self._get_cached(f"{RELEASE_URL}/{stub['id']}", {"inc": RELEASE_INC}) if stub else {}
         return self._merge(draft, recording, release, confidence, origin)
 
     async def _search(self, query: str) -> list[dict]:
         return (await self._get(RECORDING_URL, {"query": query, "limit": 5})).get("recordings", [])
 
+    async def _get_cached(self, url: str, params: dict) -> dict:
+        """Recordings and releases are fetched by id, and the AcoustID and text-search paths run side by side, so
+        both often want the same ones."""
+        key = (url, tuple(sorted(params.items())))
+        async with self._lock:
+            found = self._cache.get(key)
+            if found and time.monotonic() - found[0] < CACHE_SECONDS:
+                return found[1]
+            data = await self._request(url, params)
+            self._cache[key] = (time.monotonic(), data)
+            while len(self._cache) > CACHE_ENTRIES:
+                del self._cache[next(iter(self._cache))]
+            return data
+
     async def _get(self, url: str, params: dict) -> dict:
         async with self._lock:
-            try:
-                response = await self._http.get(
-                    url,
-                    params={**params, "fmt": "json"},
-                    headers={"User-Agent": self._user_agent},
-                    timeout=15,
-                )
-                response.raise_for_status()
-                return response.json()
-            except (httpx.HTTPError, ValueError) as error:
-                log.warning("MusicBrainz lookup failed: %s", error)
-                raise LookupUnavailable("musicbrainz") from error
-            finally:
-                await asyncio.sleep(REQUEST_SPACING_SECONDS)
+            return await self._request(url, params)
+
+    async def _request(self, url: str, params: dict) -> dict:
+        """One rate-limited request; the caller holds the lock."""
+        try:
+            response = await self._http.get(
+                url,
+                params={**params, "fmt": "json"},
+                headers={"User-Agent": self._user_agent},
+                timeout=15,
+            )
+            response.raise_for_status()
+            return response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            log.warning("MusicBrainz lookup failed: %s", error)
+            raise LookupUnavailable("musicbrainz") from error
+        finally:
+            await asyncio.sleep(REQUEST_SPACING_SECONDS)
 
     def _matches(self, recording: dict, draft: TrackMetadata, duration_seconds: float | None) -> bool:
         if recording.get("score", 0) < MIN_SEARCH_SCORE:

@@ -105,7 +105,7 @@ class Config:
             llm_api_key=os.environ.get("LLM_API_KEY", ""),
             llm_json_mode=os.environ.get("LLM_JSON_MODE", "schema"),
             llm_timeout_seconds=float(os.environ.get("LLM_TIMEOUT_SECONDS", "60")),
-            llm_description_chars=int(os.environ.get("LLM_DESCRIPTION_CHARS", "2000")),
+            llm_description_chars=int(os.environ.get("LLM_DESCRIPTION_CHARS", "5000")),
             llm_call_log=Path(call_log) if call_log else None,
             navidrome_url=os.environ.get("NAVIDROME_URL", "").rstrip("/"),
             navidrome_user=os.environ.get("NAVIDROME_USER", ""),

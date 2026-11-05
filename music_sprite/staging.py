@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .downloader import DownloadedTrack
-from .models import TrackMetadata
+from .models import Choices, Findings, TrackMetadata
+from .reconcile import Reconciled, reconcile
 
 ENTRY_FILE = "entry.json"
 INCOMING_DIR = ".incoming"
@@ -25,11 +26,14 @@ class QueueEntry:
     created_at: str
     status: str = "pending"
     resolve_error: str | None = None
-    edited: bool = False
     resolve_steps: list[str] = field(default_factory=list)
-    candidates: list[TrackMetadata] = field(default_factory=list)
-    candidate_index: int | None = None
+    findings: Findings | None = None
+    choices: Choices = field(default_factory=Choices)
     meta: TrackMetadata | None = None
+    # Where the review card is shown: it can span several messages, first to last.
+    review_channel: int | None = None
+    review_messages: list[int] = field(default_factory=list)
+    review_note: str | None = None
     _info: dict | None = field(default=None, repr=False, compare=False)
 
     @property
@@ -50,6 +54,28 @@ class QueueEntry:
             self._info = json.loads(self.info_path.read_text(encoding="utf-8"))
         return self._info
 
+    @property
+    def edited(self) -> bool:
+        return bool(self.choices.manual)
+
+    @property
+    def needs_choice(self) -> bool:
+        """True when equally good MusicBrainz releases tie, so a person should pick one."""
+        return bool(self.findings and len(self.findings.releases) > 1)
+
+    def reconcile(self) -> Reconciled | None:
+        return reconcile(self.findings, self.choices) if self.findings else None
+
+    def refresh_meta(self) -> None:
+        """Re-derives the metadata that gets tagged from the findings, the user's choices and hand edits."""
+        if reconciled := self.reconcile():
+            self.meta = reconciled.metadata
+
+    def set_findings(self, findings: Findings) -> None:
+        self.findings = findings
+        self.choices = Choices()
+        self.refresh_meta()
+
     def require_meta(self) -> TrackMetadata:
         if self.meta is None:
             raise ValueError(f"queue entry {self.id} has no metadata yet")
@@ -68,20 +94,27 @@ class QueueEntry:
             "status": self.status,
             "resolve_error": self.resolve_error,
             "resolve_steps": self.resolve_steps,
-            "candidates": [candidate.to_dict() for candidate in self.candidates],
-            "candidate_index": self.candidate_index,
-            "edited": self.edited,
+            "findings": self.findings.to_dict() if self.findings else None,
+            "choices": self.choices.to_dict(),
             "meta": self.meta.to_dict() if self.meta else None,
+            "review_channel": self.review_channel,
+            "review_messages": self.review_messages,
+            "review_note": self.review_note,
         }
 
     @classmethod
     def from_json(cls, directory: Path, data: dict) -> "QueueEntry":
-        meta = data.pop("meta")
-        candidates = [TrackMetadata.from_dict(candidate) for candidate in data.pop("candidates", [])]
+        meta = TrackMetadata.from_dict(data.pop("meta")) if data.get("meta") else None
+        findings = data.pop("findings", None)
+        choices = data.pop("choices", None)
+        # Entries saved before lookups kept their findings: the tags they had become the one source they now have.
+        for legacy_key in ("edited", "candidates", "candidate_index"):
+            data.pop(legacy_key, None)
         return cls(
             directory=directory,
-            meta=TrackMetadata.from_dict(meta) if meta else None,
-            candidates=candidates,
+            meta=meta,
+            findings=Findings.from_dict(findings) if findings else Findings(upload=meta, audio=meta.audio) if meta else None,
+            choices=Choices.from_dict(choices) if choices else Choices(),
             **data,
         )
 

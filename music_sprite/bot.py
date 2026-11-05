@@ -16,8 +16,11 @@ from .config import Config
 from .downloader import DownloadError, DownloadedTrack, download, sanitize_extra_args
 from .llm import LlmClient
 from .musicbrainz import MusicBrainzClient
-from .panels import DYNAMIC_ITEMS, build_queue_view, build_review_view, lookup_progress, lookup_status, status_view, truncate
+from .panels import DYNAMIC_ITEMS as PANEL_ITEMS
+from .panels import build_queue_view, lookup_progress, lookup_status, status_view, truncate
 from .resolver import MetadataResolver, ProgressCallback
+from .review import DYNAMIC_ITEMS as REVIEW_ITEMS
+from .review import build_review_pages
 from .staging import QueueEntry, Staging
 
 log = logging.getLogger(__name__)
@@ -72,7 +75,7 @@ class MusicBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.http_client = httpx.AsyncClient()
-        self.add_dynamic_items(*DYNAMIC_ITEMS)
+        self.add_dynamic_items(*PANEL_ITEMS, *REVIEW_ITEMS)
         self.resolver = MetadataResolver(
             self.config,
             AcoustIdClient(self.http_client, self.config),
@@ -186,11 +189,9 @@ class MusicBot(discord.Client):
             waiting = [entry for entry in entries if self.staging.get(entry.id)]
             summary = self._batch_summary(entries, waiting, imported, len(failed_items))
             if len(waiting) == 1:
-                view = build_review_view(self, waiting[0], note=summary)
-            elif waiting:
-                view = build_queue_view(self, note=summary)
-            else:
-                view = status_view(summary)
+                await self.publish_review(waiting[0], reply.channel.id, first=reply, note=summary)
+                return
+            view = build_queue_view(self, note=summary) if waiting else status_view(summary)
         except Exception:
             log.exception("lookup stage failed for %s", url)
             view = status_view(f"Queued {len(entries)} track(s), but metadata lookup crashed; see the service log.")
@@ -204,12 +205,12 @@ class MusicBot(discord.Client):
             and entry.meta
             and entry.meta.artist
             and entry.meta.confidence >= threshold
-            and not entry.candidates
+            and not entry.needs_choice
         )
 
     def _batch_summary(self, entries: list[QueueEntry], waiting: list[QueueEntry], imported: int, failed_items: int) -> str:
         incomplete = sum(entry.status != "resolved" for entry in waiting)
-        needs_choice = sum(bool(entry.candidates) for entry in waiting)
+        needs_choice = sum(entry.needs_choice for entry in waiting)
         parts = [f"Downloaded {len(entries)} track(s)."]
         if imported:
             parts.append(f"{imported} added to the library automatically.")
@@ -233,10 +234,7 @@ class MusicBot(discord.Client):
             entry.status = "pending"
             entry.resolve_error = "Lookup crashed; see the service log."
         else:
-            entry.meta = resolution.metadata
-            entry.edited = False
-            entry.candidates = resolution.candidates
-            entry.candidate_index = 0 if resolution.candidates else None
+            entry.set_findings(resolution.findings)
             entry.resolve_steps = resolution.steps
             entry.status = "partial" if resolution.unavailable_services else "resolved"
             entry.resolve_error = (
@@ -269,6 +267,67 @@ class MusicBot(discord.Client):
         artist = discord.utils.escape_markdown(meta.artist)
         title = discord.utils.escape_markdown(meta.title)
         return f"Added **{artist} – {title}**\n-# {relative}"
+
+    async def publish_review(
+        self,
+        entry: QueueEntry,
+        channel_id: int | None,
+        *,
+        first: discord.PartialMessage | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Shows the review card in a channel: `first` (say, the lookup progress message) becomes its first message
+        and the rest are posted after it. Any card the entry already had is removed."""
+        assert channel_id is not None
+        await self.discard_review_pages(entry, keep=first.id if first else None)
+        entry.review_channel = channel_id
+        entry.review_note = note
+        channel = self.get_partial_messageable(channel_id)
+        ids: list[int] = []
+        for index, page in enumerate(build_review_pages(self, entry)):
+            if index == 0 and first is not None:
+                await first.edit(view=page)
+                ids.append(first.id)
+            else:
+                ids.append((await channel.send(view=page)).id)
+        entry.review_messages = ids
+        self.staging.save(entry)
+
+    async def sync_review(self, entry: QueueEntry) -> None:
+        """Re-renders every message of the review card; a choice can change fields on any of them, and the number
+        of messages can change with it."""
+        if entry.review_channel is None:
+            return
+        channel = self.get_partial_messageable(entry.review_channel)
+        pages = build_review_pages(self, entry)
+        existing = list(entry.review_messages)
+        ids: list[int] = []
+        for index, page in enumerate(pages):
+            if index < len(existing):
+                try:
+                    await channel.get_partial_message(existing[index]).edit(view=page)
+                    ids.append(existing[index])
+                    continue
+                except discord.NotFound:
+                    pass
+            ids.append((await channel.send(view=page)).id)
+        await self._delete_messages(entry.review_channel, existing[len(pages) :])
+        entry.review_messages = ids
+        self.staging.save(entry)
+
+    async def discard_review_pages(self, entry: QueueEntry, keep: int | None = None) -> None:
+        """Deletes the review card's messages except `keep`. The caller saves the entry if it stays in the queue."""
+        if entry.review_channel is not None:
+            await self._delete_messages(entry.review_channel, [mid for mid in entry.review_messages if mid != keep])
+        entry.review_messages = [keep] if keep is not None else []
+
+    async def _delete_messages(self, channel_id: int, message_ids: list[int]) -> None:
+        channel = self.get_partial_messageable(channel_id)
+        for message_id in message_ids:
+            try:
+                await channel.get_partial_message(message_id).delete()
+            except discord.HTTPException:
+                log.warning("could not delete review message %s", message_id, exc_info=True)
 
 
 @app_commands.describe(url="Link to download", options="Optional yt-dlp options, e.g. --no-playlist --playlist-items 1-5")

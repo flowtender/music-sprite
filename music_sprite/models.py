@@ -128,3 +128,61 @@ class TrackMetadata:
             release=ReleaseInfo(**release),
             audio=AudioFeatures(**audio) if audio else None,
         )
+
+
+# Where a value can come from, strongest first: the default for a field is its first source that has a value.
+SOURCES = ("essentia", "musicbrainz", "llm", "upload")
+SOURCE_LABELS = {"essentia": "Essentia", "musicbrainz": "MusicBrainz", "llm": "LLM", "upload": "Upload"}
+
+
+@dataclass
+class LlmVerdict:
+    """The LLM's answers for the fields the other sources could not settle."""
+
+    model: str
+    asked: list[str] = field(default_factory=list)
+    # Asked field -> answer; a field the LLM found no evidence for is absent. "release" is an index into releases.
+    answers: dict[str, str | int] = field(default_factory=dict)
+    reasoning: str = ""
+    confidence: float = 0.0
+
+
+@dataclass
+class Findings:
+    """Everything the independent sources found for one upload, before any choice between them is made."""
+
+    upload: TrackMetadata  # heuristics over the site's own tags
+    # MusicBrainz matches, best first. Each is one recording on one release, so choosing one picks the whole release.
+    releases: list[TrackMetadata] = field(default_factory=list)
+    audio: AudioFeatures | None = None
+    llm: LlmVerdict | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Findings":
+        llm = data.get("llm")
+        audio = data.get("audio")
+        return cls(
+            upload=TrackMetadata.from_dict(data["upload"]),
+            releases=[TrackMetadata.from_dict(release) for release in data.get("releases", [])],
+            audio=AudioFeatures(**audio) if audio else None,
+            llm=LlmVerdict(**llm) if llm else None,
+        )
+
+
+@dataclass
+class Choices:
+    """What the user decided; anything not decided here follows the source precedence."""
+
+    release: int | None = None  # index into Findings.releases
+    fields: dict[str, str] = field(default_factory=dict)  # field -> the source to take it from
+    manual: dict[str, object] = field(default_factory=dict)  # field -> a value typed by hand
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Choices":
+        return cls(**data)

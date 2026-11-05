@@ -1,54 +1,61 @@
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field, replace
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import heuristics
 from .acoustid import AcoustIdClient
-from .analysis import AnalysisError, Analyzer, describe, guessed_genres
+from .analysis import AnalysisError, Analyzer, describe
 from .config import Config
 from .llm import LlmClient
-from .models import LookupUnavailable, TrackMetadata
+from .models import AudioFeatures, Findings, LlmVerdict, LookupUnavailable, TrackMetadata
 from .musicbrainz import MusicBrainzClient
+from .reconcile import ambiguous_fields
 
 log = logging.getLogger(__name__)
 
-TRUSTED_SOURCE_CONFIDENCE = 0.9
 MAX_LISTED_RELEASES = 3
 MAX_LISTED_CREDITS = 3
 
-# Called with the finished steps so far and what is running right now (None between steps).
-ProgressCallback = Callable[[list[str], str | None], Awaitable[None]]
+# Called with the finished steps so far and what is running right now.
+ProgressCallback = Callable[[list[str], list[str]], Awaitable[None]]
 
 
 @dataclass
 class Resolution:
-    metadata: TrackMetadata
+    findings: Findings
     unavailable_services: list[str]
     steps: list[str] = field(default_factory=list)
-    # Two or more equally good matches for the user to choose between; empty when the match is unambiguous.
-    candidates: list[TrackMetadata] = field(default_factory=list)
 
 
 class _Steps:
-    """The lookup log: finished steps plus the one running now, reported live so the user can follow along."""
+    """The lookup log: finished steps plus those running now, reported live so the user can follow along."""
 
     def __init__(self, notify: ProgressCallback | None):
         self.lines: list[str] = []
+        self._running: list[str] = []
         self._notify = notify
 
     async def add(self, text: str) -> None:
         self.lines.append(text)
-        await self._push(None)
+        await self._push()
 
-    async def working(self, text: str) -> None:
-        await self._push(text)
+    @asynccontextmanager
+    async def working(self, text: str):
+        self._running.append(text)
+        await self._push()
+        try:
+            yield
+        finally:
+            self._running.remove(text)
 
-    async def _push(self, working: str | None) -> None:
+    async def _push(self) -> None:
         if self._notify is None:
             return
         try:
-            await self._notify(self.lines, working)
+            await self._notify(self.lines, list(self._running))
         except Exception:
             # A failed progress display (say, the message was deleted) must not abort the lookup itself.
             log.warning("progress update failed; continuing without live progress", exc_info=True)
@@ -119,6 +126,10 @@ def _distinct(matches: list[TrackMetadata]) -> list[TrackMetadata]:
     return unique
 
 
+def _recordings(matches: list[TrackMetadata]) -> set[str]:
+    return {match.musicbrainz.recording_id for match in matches if match.musicbrainz}
+
+
 class MetadataResolver:
     def __init__(
         self,
@@ -135,87 +146,86 @@ class MetadataResolver:
         self._analyzer = analyzer
 
     async def resolve(self, info: dict, audio_path: Path, progress: ProgressCallback | None = None) -> Resolution:
+        """Runs every source on every track. They do not depend on one another, so they run side by side; the LLM
+        comes last because it reads what the others found."""
         steps = _Steps(progress)
-        resolution = await self._resolve(info, audio_path, steps)
-        await self._analyze(resolution, audio_path, steps)
-        return resolution
-
-    async def _analyze(self, resolution: Resolution, audio_path: Path, steps: _Steps) -> None:
-        reason = self._analyzer.disabled_reason
-        if reason:
-            await steps.add(f"Analysis: skipped ({reason})")
-            return
-        await steps.working("Analyzing the audio (tempo, key, genre, mood, loudness)")
-        try:
-            features = await self._analyzer.analyze(audio_path)
-        except AnalysisError as error:
-            await steps.add(f"Analysis: failed ({error})")
-            return
-        except Exception:
-            log.exception("audio analysis crashed for %s", audio_path)
-            await steps.add("Analysis: crashed; see the service log")
-            return
-        for line in describe(features):
-            await steps.add(f"Analysis: {line}")
-
-        def with_analysis(meta: TrackMetadata) -> TrackMetadata:
-            return replace(meta, audio=features, genres=meta.genres or guessed_genres(features))
-
-        resolution.metadata = with_analysis(resolution.metadata)
-        resolution.candidates = [with_analysis(candidate) for candidate in resolution.candidates]
-
-    async def _resolve(self, info: dict, audio_path: Path, steps: _Steps) -> Resolution:
-        duration = info.get("duration")
         unavailable: list[str] = []
+        duration = info.get("duration")
         draft = heuristics.guess(info, self._config.known_publishers)
         await steps.add(
-            f"Heuristic ({draft.origin}): {_detail(draft)} · confidence {draft.confidence:.0%}"
+            f"Upload ({draft.origin}): {_detail(draft)} · confidence {draft.confidence:.0%}"
             + (" · known publisher" if draft.from_known_publisher else "")
         )
 
-        matches = await self._identify_by_audio(audio_path, draft, unavailable, steps)
-        if matches:
-            return self._resolution(matches, draft, duration, unavailable, steps)
+        async with asyncio.TaskGroup() as group:
+            identified = group.create_task(self._identify_by_audio(audio_path, draft, unavailable, steps))
+            searched = group.create_task(self._search_musicbrainz(draft, duration, unavailable, steps))
+            analysis = group.create_task(self._analyze(audio_path, steps))
 
-        matches = await self._enrich(draft, duration, unavailable, steps)
-        if matches:
-            return self._resolution(matches, draft, duration, unavailable, steps)
+        verified, found = identified.result(), searched.result()
+        if verified and found and not _recordings(found) <= _recordings(verified):
+            await steps.add("MusicBrainz search: found other recordings; the AcoustID match is used instead")
+        findings = Findings(
+            upload=draft,
+            # A fingerprint match is verified by the audio itself, so it outranks whatever a text search found.
+            releases=self._rank(verified or found, duration),
+            audio=analysis.result(),
+        )
+        findings.llm = await self._ask_llm(info, findings, unavailable, steps)
+        return Resolution(findings, list(dict.fromkeys(unavailable)), steps.lines)
 
-        if draft.confidence >= TRUSTED_SOURCE_CONFIDENCE:
-            await steps.add("LLM: skipped (source tags already trusted)")
-            return Resolution(draft, unavailable, steps.lines)
+    async def _analyze(self, audio_path: Path, steps: _Steps) -> AudioFeatures | None:
+        reason = self._analyzer.disabled_reason
+        if reason:
+            await steps.add(f"Analysis: skipped ({reason})")
+            return None
+        async with steps.working("Analyzing the audio (tempo, key, genre, mood, loudness)"):
+            try:
+                features = await self._analyzer.analyze(audio_path)
+            except AnalysisError as error:
+                await steps.add(f"Analysis: failed ({error})")
+                return None
+            except Exception:
+                log.exception("audio analysis crashed for %s", audio_path)
+                await steps.add("Analysis: crashed; see the service log")
+                return None
+        for line in describe(features):
+            await steps.add(f"Analysis: {line}")
+        return features
+
+    async def _ask_llm(
+        self, info: dict, findings: Findings, unavailable: list[str], steps: _Steps
+    ) -> LlmVerdict | None:
+        asked = ambiguous_fields(findings)
         if not self._llm.enabled:
             await steps.add("LLM: skipped (LLM_MODEL not set)")
-            return Resolution(draft, unavailable, steps.lines)
+            return None
+        if not asked:
+            await steps.add("LLM: skipped (the other sources leave nothing ambiguous)")
+            return None
+        async with steps.working(f"Asking the LLM about {', '.join(asked)}"):
+            try:
+                verdict = await self._llm.resolve(info, findings, asked)
+            except LookupUnavailable as error:
+                unavailable.append(str(error))
+                await steps.add("LLM: unavailable")
+                return None
+        answers = " · ".join(f"{name} {value}" for name, value in verdict.answers.items())
+        await steps.add(
+            f"LLM ({verdict.model}, asked {', '.join(asked)}): {answers or 'nothing in the information answers it'}"
+            f" · confidence {verdict.confidence:.0%}" + (f" · {verdict.reasoning}" if verdict.reasoning else "")
+        )
+        return verdict
 
-        await steps.working("Asking the LLM")
-        try:
-            refined = await self._llm.refine(info, draft)
-        except LookupUnavailable as error:
-            await steps.add("LLM: unavailable")
-            return Resolution(draft, [*unavailable, str(error)], steps.lines)
-        await steps.add(f"LLM ({refined.origin}): {_detail(refined)} · confidence {refined.confidence:.0%}")
-        matches = await self._enrich(refined, duration, unavailable, steps)
-        if matches:
-            return self._resolution(matches, refined, duration, unavailable, steps)
-        return Resolution(refined, unavailable, steps.lines)
-
-    def _resolution(
-        self,
-        matches: list[TrackMetadata],
-        earlier: TrackMetadata,
-        duration: float | None,
-        unavailable: list[str],
-        steps: _Steps,
-    ) -> Resolution:
+    @staticmethod
+    def _rank(matches: list[TrackMetadata], duration: float | None) -> list[TrackMetadata]:
         def rank(match: TrackMetadata) -> tuple[int, int]:
             # Closest in length first (to the second, so 1.0s vs 1.04s is a tie), then the earliest release.
             length = match.musicbrainz.length_seconds if match.musicbrainz else None
             gap = round(abs(length - duration)) if length and duration else 0
             return gap, match.year or 9999
 
-        ranked = [self._keep_source_genre(match, earlier) for match in sorted(_distinct(matches), key=rank)]
-        return Resolution(ranked[0], unavailable, steps.lines, candidates=ranked if len(ranked) > 1 else [])
+        return sorted(_distinct(matches), key=rank)
 
     async def _identify_by_audio(
         self, audio_path: Path, draft: TrackMetadata, unavailable: list[str], steps: _Steps
@@ -224,49 +234,46 @@ class MetadataResolver:
         if reason:
             await steps.add(f"AcoustID: skipped ({reason})")
             return []
-        await steps.working("Fingerprinting the audio (AcoustID)")
-        try:
-            match = await self._acoustid.identify(audio_path)
-        except LookupUnavailable as error:
-            unavailable.append(str(error))
-            await steps.add(f"AcoustID: {error} unavailable")
-            return []
+        async with steps.working("Fingerprinting the audio (AcoustID)"):
+            try:
+                match = await self._acoustid.identify(audio_path)
+            except LookupUnavailable as error:
+                unavailable.append(str(error))
+                await steps.add(f"AcoustID: {error} unavailable")
+                return []
         if match is None:
             await steps.add("AcoustID: no confident match")
             return []
 
-        await steps.working(f"Fetching {len(match.recording_ids)} matching recording(s) from MusicBrainz")
         identified: list[TrackMetadata] = []
-        for recording_id in match.recording_ids:
-            try:
-                identified.append(
-                    await self._musicbrainz.fetch_recording(recording_id, draft, match.score, "acoustid+musicbrainz")
-                )
-            except LookupUnavailable as error:
-                unavailable.append(str(error))
-                break
+        async with steps.working(f"Fetching {len(match.recording_ids)} matching recording(s) from MusicBrainz"):
+            for recording_id in match.recording_ids:
+                try:
+                    identified.append(
+                        await self._musicbrainz.fetch_recording(recording_id, draft, match.score, "acoustid+musicbrainz")
+                    )
+                except LookupUnavailable as error:
+                    unavailable.append(str(error))
+                    break
         if not identified:
             await steps.add("AcoustID: matched a recording but MusicBrainz is unavailable")
             return []
         await self._note_matches(steps, "AcoustID", _distinct(identified), f"{match.score:.0%}")
         return identified
 
-    async def _enrich(
+    async def _search_musicbrainz(
         self, draft: TrackMetadata, duration: float | None, unavailable: list[str], steps: _Steps
     ) -> list[TrackMetadata]:
-        if "musicbrainz" in unavailable:
-            await steps.add("MusicBrainz search: skipped (unavailable)")
-            return []
         if not draft.artist or not draft.title:
             await steps.add("MusicBrainz search: skipped (no artist or title to search for)")
             return []
-        await steps.working(f"Searching MusicBrainz for {_describe(draft)}")
-        try:
-            matches = await self._musicbrainz.enrich(draft, duration)
-        except LookupUnavailable as error:
-            unavailable.append(str(error))
-            await steps.add("MusicBrainz search: unavailable")
-            return []
+        async with steps.working(f"Searching MusicBrainz for {_describe(draft)}"):
+            try:
+                matches = await self._musicbrainz.enrich(draft, duration)
+            except LookupUnavailable as error:
+                unavailable.append(str(error))
+                await steps.add("MusicBrainz search: unavailable")
+                return []
         if not matches:
             await steps.add(f"MusicBrainz search: no match for {_describe(draft)}")
             return []
@@ -285,11 +292,4 @@ class MetadataResolver:
         listed = " / ".join(_release_label(match) for match in matches[:MAX_LISTED_RELEASES])
         hidden = len(matches) - MAX_LISTED_RELEASES
         more = f" / +{hidden} more" if hidden > 0 else ""
-        await steps.add(
-            f"{source}: {len(matches)} equally good matches{suffix} for {_describe(matches[0])}: {listed}{more};"
-            " pick one in the review"
-        )
-
-    @staticmethod
-    def _keep_source_genre(matched: TrackMetadata, earlier: TrackMetadata) -> TrackMetadata:
-        return replace(matched, genres=matched.genres or earlier.genres)
+        await steps.add(f"{source}: {len(matches)} equally good matches{suffix} for {_describe(matches[0])}: {listed}{more}")
