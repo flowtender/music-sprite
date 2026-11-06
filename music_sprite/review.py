@@ -462,15 +462,22 @@ async def _review_next(interaction: discord.Interaction, done: QueueEntry) -> No
     """Shows the next track's card below the status `done` left, so a queue can be worked through card by card. A track
     never looked up is looked up first, its progress shown in the message that then becomes its card."""
     bot = bot_of(interaction)
-    entry = bot.staging.next_to_review(done)
-    if entry is None:
+    entry, waited = bot.staging.next_to_review(done), False
+    while entry is not None and bot.pipeline.claimed(entry.id):
+        # Another message is showing its lookup (the download's that brought it, say): its card follows when that is
+        # done, unless the track was imported automatically or discarded meanwhile.
+        await bot.pipeline.until_released(entry.id)
+        fresh = bot.staging.get(entry.id)
+        entry, waited = (fresh, True) if fresh else (bot.staging.next_to_review(entry), False)
+    if entry is None or (waited and entry.review_messages):  # a card shown by whatever had the track stays put
         return
-    first = None
-    if entry.status == EntryStatus.PENDING:
-        channel = bot.get_partial_messageable(interaction.channel_id)
-        first = await channel.send(view=status_view(lookup_status(entry, 1, 1)))
-        await look_up(bot.pipeline, [entry], edit_status_of_message(first))
-    await bot.publish_review(entry, interaction.channel_id, first=first)
+    with bot.pipeline.claiming(entry):
+        first = None
+        if entry.status == EntryStatus.PENDING and not waited:  # a lookup that just crashed isn't retried at once
+            channel = bot.get_partial_messageable(interaction.channel_id)
+            first = await channel.send(view=status_view(lookup_status(entry, 1, 1)))
+            await look_up(bot.pipeline, entry, edit_status_of_message(first))
+        await bot.publish_review(entry, interaction.channel_id, first=first)
 
 
 class ReviewAction(
@@ -511,10 +518,11 @@ class ReviewAction(
             entry.ensure_findings(bot.config.lookup.known_publishers)
             await interaction.response.send_modal(EditModal(entry))
         elif self.action == "lookup":
-            await interaction.response.edit_message(view=status_view(lookup_status(entry, 1, 1)))
-            await bot.discard_review_pages(entry, keep=clicked.id)
-            await look_up(bot.pipeline, [entry], edit_status_of(interaction), overwrite_edits=True)
-            await bot.publish_review(entry, interaction.channel_id, first=clicked)
+            with bot.pipeline.claiming(entry):
+                await interaction.response.edit_message(view=status_view(lookup_status(entry, 1, 1)))
+                await bot.discard_review_pages(entry, keep=clicked.id)
+                await look_up(bot.pipeline, entry, edit_status_of(interaction), overwrite_edits=True)
+                await bot.publish_review(entry, interaction.channel_id, first=clicked)
         elif self.action == "discard":
             await interaction.response.edit_message(view=status_view(f"Discarded **{escape(entry_label(entry))}**."))
             await bot.discard_review_pages(entry, keep=clicked.id)

@@ -4,7 +4,8 @@ import asyncio
 import logging
 import shutil
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,26 +70,60 @@ class Pipeline:
         self._http = http
         self._download_slots = asyncio.Semaphore(queue.max_concurrent_downloads)
         self._importing: set[str] = set()
+        # Entries something is looking up or about to show the card of, each with an event set once it is done.
+        self._claims: dict[str, asyncio.Event] = {}
 
     async def download(
         self, url: str, extra_args: list[str], requested_by: int, on_track: Callable[[int], Awaitable[None]]
     ) -> Batch:
         """Downloads into the queue, calling on_track with the count so far as each track arrives. Raises
-        DownloadError when nothing could be downloaded."""
+        DownloadError when nothing could be downloaded.
+
+        The batch's entries come claimed (see claiming): the caller looks them up and releases each when done."""
         batch_id = uuid.uuid4().hex[:8]
         incoming = self._staging.incoming_dir(batch_id)
         entries: list[QueueEntry] = []
 
         async def adopt(track: downloader.DownloadedTrack) -> None:
-            entries.append(self._staging.adopt(track, url, requested_by, batch_id))
+            entry = self._staging.adopt(track, url, requested_by, batch_id)
+            self._claims[entry.id] = asyncio.Event()
+            entries.append(entry)
             await on_track(len(entries))
 
         try:
             async with self._download_slots:
                 failed = await downloader.download(url, extra_args, incoming, self._queue.max_playlist_items, adopt)
+        except BaseException:
+            self.release(*entries)
+            raise
         finally:
             shutil.rmtree(incoming, ignore_errors=True)
         return Batch(entries, len(failed))
+
+    def claimed(self, entry_id: str) -> bool:
+        return entry_id in self._claims
+
+    async def until_released(self, entry_id: str) -> None:
+        if (claim := self._claims.get(entry_id)) is not None:
+            await claim.wait()
+
+    def release(self, *entries: QueueEntry) -> None:
+        for entry in entries:
+            if (claim := self._claims.pop(entry.id, None)) is not None:
+                claim.set()
+
+    @contextmanager
+    def claiming(self, entry: QueueEntry) -> Iterator[None]:
+        """Claims the entry for the block unless something else already has it. A claim says the entry's lookup
+        progress, and then its card, are on their way in some message, so nothing else should start another."""
+        if entry.id in self._claims:
+            yield
+            return
+        self._claims[entry.id] = asyncio.Event()
+        try:
+            yield
+        finally:
+            self.release(entry)
 
     async def resolve_entry(
         self, entry: QueueEntry, overwrite_edits: bool = False, progress: ProgressCallback | None = None
@@ -127,13 +162,9 @@ class Pipeline:
             and not entry.needs_choice
         )
 
-    async def auto_import(self, entries: list[QueueEntry]) -> int:
-        """Imports the entries that are sure enough to skip review; returns how many were added."""
-        added = 0
-        for entry in entries:
-            if self.qualifies_for_auto_import(entry):
-                added += (await self.import_entry(entry)).added
-        return added
+    async def auto_import(self, entry: QueueEntry) -> bool:
+        """Imports the entry if it is sure enough to skip review; returns whether it was added."""
+        return self.qualifies_for_auto_import(entry) and (await self.import_entry(entry)).added
 
     async def import_entry(self, entry: QueueEntry) -> ImportResult:
         meta = entry.require_meta()

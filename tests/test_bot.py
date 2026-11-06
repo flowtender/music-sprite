@@ -82,7 +82,27 @@ class TestDownloadBatch:
             in final
         )
         assert "### Download queue · 2 track(s)" in final
-        music_bot.publish_review.assert_not_awaited()
+
+    def test_the_first_track_to_review_gets_its_card_as_soon_as_it_is_looked_up(self, music_bot, resolver, downloads):
+        downloads.count = 3
+        events = []
+
+        async def resolve(info, audio_path, progress):
+            events.append(f"lookup {info['title']}")
+            return resolution()
+
+        def publish(entry, channel_id, **kwargs):
+            # Still claimed, so an Approve waiting for this track only goes on once the card is up.
+            events.append(f"card {entry.info['title']}" + (" (claimed)" if music_bot.pipeline.claimed(entry.id) else ""))
+            assert channel_id == 555 and "first" not in kwargs  # below the progress message, which goes on
+
+        resolver.resolve.side_effect = resolve
+        music_bot.publish_review.side_effect = publish
+        reply = FakeReply()
+        run(music_bot._run_download(reply, "https://x", [], 1))
+        assert events == ["lookup Track 0", "card Track 0 (claimed)", "lookup Track 1", "lookup Track 2"]
+        assert "### Download queue · 3 track(s)" in texts(reply.views[-1])
+        assert not any(music_bot.pipeline.claimed(entry.id) for entry in music_bot.staging.list())
 
     def test_confident_tracks_are_imported_and_ties_wait_for_a_choice(
         self, music_bot, make_pipeline, resolver, downloads, imported
@@ -105,6 +125,12 @@ class TestDownloadBatch:
         run(music_bot._run_download(reply, "https://x", [], 1))
         assert texts(reply.views[-1]) == "Download failed:\n```\nERROR: unsupported URL\n```"
         assert resolver.resolve.await_count == 0
+
+    def test_a_download_that_fails_partway_leaves_its_tracks_unclaimed(self, music_bot, downloads):
+        downloads.count, downloads.error = 2, "ERROR: yt-dlp timed out"
+        run(music_bot._run_download(FakeReply(), "https://x", [], 1))
+        entries = music_bot.staging.list()
+        assert len(entries) == 2 and not any(music_bot.pipeline.claimed(entry.id) for entry in entries)
 
     def test_lookup_progress_is_shown_for_each_track(self, music_bot, resolver, downloads):
         downloads.count = 2

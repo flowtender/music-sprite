@@ -99,11 +99,9 @@ def lookup_progress(entry: QueueEntry, position: int, total: int, display: Displ
     return update
 
 
-async def look_up(pipeline: Pipeline, entries: list[QueueEntry], display: Display, *, overwrite_edits: bool = False) -> None:
-    """Looks the entries up one after another, showing each one's progress through `display`."""
-    for position, entry in enumerate(entries, start=1):
-        progress = lookup_progress(entry, position, len(entries), display)
-        await pipeline.resolve_entry(entry, overwrite_edits=overwrite_edits, progress=progress)
+async def look_up(pipeline: Pipeline, entry: QueueEntry, display: Display, *, overwrite_edits: bool = False) -> None:
+    """Looks one track up, showing its progress through `display`."""
+    await pipeline.resolve_entry(entry, overwrite_edits=overwrite_edits, progress=lookup_progress(entry, 1, 1, display))
 
 
 def edit_status_of(interaction: discord.Interaction) -> Display:

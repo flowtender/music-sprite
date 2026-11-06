@@ -24,8 +24,10 @@ def texts(view):
 
 
 @pytest.fixture
-def queue_bot(staging):
-    return SimpleNamespace(staging=staging, pipeline=SimpleNamespace(resolve_entry=AsyncMock()), publish_review=AsyncMock())
+def queue_bot(staging, make_pipeline):
+    pipeline = make_pipeline()
+    pipeline.resolve_entry = AsyncMock()
+    return SimpleNamespace(staging=staging, pipeline=pipeline, publish_review=AsyncMock())
 
 
 @pytest.fixture

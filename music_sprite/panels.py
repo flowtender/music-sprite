@@ -92,14 +92,15 @@ class QueueTrackAction(
             view = build_queue_view(bot, page=self.page, note="That track is no longer in the queue.")
             await interaction.response.edit_message(view=view)
             return
-        if self.action == "lookup":
-            # A lookup takes several seconds; the list makes way for its progress so nothing is clicked meanwhile.
-            await interaction.response.edit_message(view=status_view(lookup_status(entry, 1, 1)))
-            await look_up(bot.pipeline, [entry], edit_status_of(interaction), overwrite_edits=True)
-            await interaction.edit_original_response(view=build_queue_view(bot, page=self.page, note=note))
-        else:
-            await interaction.response.defer()
-        await bot.publish_review(entry, interaction.channel_id)
+        with bot.pipeline.claiming(entry):
+            if self.action == "lookup":
+                # A lookup takes several seconds; the list makes way for its progress so nothing is clicked meanwhile.
+                await interaction.response.edit_message(view=status_view(lookup_status(entry, 1, 1)))
+                await look_up(bot.pipeline, entry, edit_status_of(interaction), overwrite_edits=True)
+                await interaction.edit_original_response(view=build_queue_view(bot, page=self.page, note=note))
+            else:
+                await interaction.response.defer()
+            await bot.publish_review(entry, interaction.channel_id)
 
 
 class QueuePage(AllowedUsersOnly, DynamicItem[Button], template=r"ms:q:(?P<action>prev|next):(?P<page>\d+)"):

@@ -78,12 +78,22 @@ class TestAutoImport:
         pipeline = make_pipeline(auto_import_confidence=0.99)
         assert not pipeline.qualifies_for_auto_import(self._resolved(pipeline, resolver, make_entry))
 
-    def test_only_qualifying_entries_are_imported_and_counted(self, make_pipeline, resolver, make_entry, imported):
+    def test_only_a_qualifying_entry_is_imported(self, make_pipeline, resolver, make_entry, imported):
         pipeline = make_pipeline(auto_import_confidence=0.9)
         sure = self._resolved(pipeline, resolver, make_entry, "aaaaaaa1")
         tie = self._resolved(pipeline, resolver, make_entry, "aaaaaaa2", releases=2)
-        assert run(pipeline.auto_import([sure, tie])) == 1
+        assert run(pipeline.auto_import(sure)) and not run(pipeline.auto_import(tie))
         assert imported == [sure.id]
+
+
+class TestClaims:
+    def test_claiming_a_claimed_entry_leaves_the_claim_to_its_holder(self, make_pipeline, make_entry):
+        pipeline, entry = make_pipeline(), make_entry()
+        with pipeline.claiming(entry):
+            with pipeline.claiming(entry):
+                pass
+            assert pipeline.claimed(entry.id)
+        assert not pipeline.claimed(entry.id)
 
 
 class TestImport:

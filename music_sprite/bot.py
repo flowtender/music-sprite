@@ -24,7 +24,7 @@ from .resolver import MetadataResolver
 from .review import DYNAMIC_ITEMS as REVIEW_ITEMS
 from .review import build_review_pages
 from .staging import QueueEntry, Staging
-from .ui import ThrottledStatus, look_up, status_view, truncate
+from .ui import ThrottledStatus, lookup_progress, status_view, truncate
 
 log = logging.getLogger(__name__)
 
@@ -155,8 +155,9 @@ class MusicBot(discord.Client):
         await self._run_download(channel.get_partial_message(original.id), url, extra_args, interaction.user.id)
 
     async def _run_download(self, reply: discord.PartialMessage, url: str, extra_args: list[str], user_id: int) -> None:
-        """Downloads, looks every track up and imports the sure ones; the progress message ends as the review card
-        of a lone track, or as the queue list."""
+        """Downloads, then looks the tracks up one by one, importing the sure ones. The first track left to review gets
+        its card as soon as it is looked up, and Approve or Discard there brings the next (review.py). The progress
+        message ends as the queue list, or as the card of the last track when that is the first left to review."""
         status = ThrottledStatus(reply)
 
         async def downloaded(count: int) -> None:
@@ -176,18 +177,32 @@ class MusicBot(discord.Client):
         async def display(text: str) -> None:
             await status.show(text, force=True)
 
+        def waiting() -> list[QueueEntry]:
+            return [entry for entry in batch.entries if self.staging.get(entry.id)]
+
+        total, imported, carded, settled = len(batch.entries), 0, False, 0
         try:
-            await look_up(self.pipeline, batch.entries, display)
-            imported = await self.pipeline.auto_import(batch.entries)
-            waiting = [entry for entry in batch.entries if self.staging.get(entry.id)]
-            summary = summarize(batch, waiting, imported)
-            if len(waiting) == 1:
-                await self.publish_review(waiting[0], reply.channel.id, first=reply, note=summary)
-                return
-            view = build_queue_view(self, note=summary) if waiting else status_view(summary)
+            for position, entry in enumerate(batch.entries, start=1):
+                await self.pipeline.resolve_entry(entry, progress=lookup_progress(entry, position, total, display))
+                imported += await self.pipeline.auto_import(entry)
+                if not carded and self.staging.get(entry.id):
+                    if position == total:  # nothing left to look up, so the progress message becomes the card
+                        note = summarize(batch, waiting(), imported)
+                        await self.publish_review(entry, reply.channel.id, first=reply, note=note)
+                        return
+                    await self.publish_review(entry, reply.channel.id)
+                    carded = True
+                # Released after its import or card, so whatever waits for this track (review.py) finds it settled.
+                self.pipeline.release(entry)
+                settled = position
+            left = waiting()
+            note = summarize(batch, left, imported)
+            view = build_queue_view(self, note=note) if left else status_view(note)
         except Exception:
             log.exception("lookup stage failed for %s", url)
             view = status_view(f"Queued {len(batch.entries)} track(s), but metadata lookup crashed; see the service log.")
+        finally:
+            self.pipeline.release(*batch.entries[settled:])
         await reply.edit(view=view)
 
     # --- review card messages ---------------------------------------------------------------------------------------

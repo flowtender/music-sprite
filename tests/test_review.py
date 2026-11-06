@@ -226,7 +226,7 @@ class FakeChannel:
 
 
 @pytest.fixture
-def discord_bot(staging):
+def discord_bot(staging, make_pipeline):
     """A MusicBot whose channel is recorded instead of sent to."""
     instance = MusicBot.__new__(MusicBot)
     instance.config = SimpleNamespace(
@@ -238,9 +238,10 @@ def discord_bot(staging):
     instance.vanished = set()
     counter = itertools.count(100)
     instance.get_partial_messageable = lambda channel_id: FakeChannel(instance.log, counter, instance.vanished)
-    instance.pipeline = SimpleNamespace(
-        import_entry=AsyncMock(return_value=ImportResult(upload(), error="x")), resolve_entry=AsyncMock()
-    )
+    # A real pipeline for its claims; lookups and imports are recorded instead of run.
+    instance.pipeline = make_pipeline()
+    instance.pipeline.import_entry = AsyncMock(return_value=ImportResult(upload(), error="x"))
+    instance.pipeline.resolve_entry = AsyncMock()
     return instance
 
 
@@ -394,6 +395,7 @@ class TestPublishing:
         discord_bot.staging.save(following)
 
         async def resolve(entry, overwrite_edits=False, progress=None):
+            assert discord_bot.pipeline.claimed(entry.id)  # so another Approve waits instead of looking it up too
             await progress(["MusicBrainz found Salt"], [])
             entry.status = EntryStatus.RESOLVED
             discord_bot.staging.save(entry)
@@ -407,6 +409,40 @@ class TestPublishing:
         assert "MusicBrainz found Salt" in shown[1]
         fresh = discord_bot.staging.get(following.id)
         assert fresh.status == EntryStatus.RESOLVED and fresh.review_messages[0] == progress
+        assert not discord_bot.pipeline.claimed(following.id)
+
+    @pytest.mark.parametrize("meanwhile", ["looked up", "imported", "card shown"])
+    def test_a_next_track_whose_lookup_shows_elsewhere_is_waited_for(
+        self, discord_bot, heavy, following, make_entry, meanwhile
+    ):
+        after = make_entry("ddddddd4")
+        after.status = EntryStatus.RESOLVED
+        discord_bot.staging.save(after)
+        interaction = click_card(discord_bot, heavy)
+
+        async def scenario():
+            with discord_bot.pipeline.claiming(following):  # the download that brought it, say
+                clicking = asyncio.create_task(ReviewAction("discard", heavy.id).callback(interaction))
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                assert discord_bot.log["sent"] == [] and not clicking.done()
+                if meanwhile == "imported":
+                    discord_bot.staging.remove(following)
+                elif meanwhile == "card shown":
+                    await discord_bot.publish_review(following, 555)
+            before_release = list(discord_bot.log["sent"])
+            await clicking
+            return before_release
+
+        before_release = run(scenario())
+        discord_bot.pipeline.resolve_entry.assert_not_awaited()
+        sent = discord_bot.log["sent"]
+        if meanwhile == "looked up":
+            assert sent and discord_bot.staging.get(following.id).review_messages == sent
+        elif meanwhile == "imported":
+            assert sent and discord_bot.staging.get(after.id).review_messages == sent
+        else:
+            assert sent == before_release == discord_bot.staging.get(following.id).review_messages
 
     def test_a_failed_import_stays_the_last_message(self, discord_bot, heavy, following):
         run(ReviewAction("approve", heavy.id).callback(click_card(discord_bot, heavy)))
