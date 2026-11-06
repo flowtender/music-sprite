@@ -60,3 +60,17 @@ def test_an_entry_saved_before_its_first_lookup_can_be_listed(staging, make_entr
     staging.save(entry)
     assert [loaded.id for loaded in staging.list()] == [entry.id]
     assert staging.get(entry.id).meta is None
+
+
+def test_the_next_card_is_the_following_track_wrapping_around(staging, make_entry):
+    # Ids run against the order of arrival, which is the queue's order.
+    first, current, last = (make_entry(entry_id) for entry_id in ("aaaaaaa3", "aaaaaaa2", "aaaaaaa1"))
+    for minute, entry in enumerate((first, current, last)):
+        entry.created_at = f"2026-11-05T10:0{minute}"
+        staging.save(entry)
+    staging.remove(current)  # approved or discarded
+
+    assert staging.next_to_review(current).id == last.id
+    assert staging.next_to_review(last).id == first.id
+    staging.remove(first)
+    assert staging.next_to_review(last) is None

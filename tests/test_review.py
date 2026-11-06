@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -14,6 +15,7 @@ from music_sprite.emojis import Emojis
 from music_sprite.models import AudioFeatures, Findings, LlmVerdict
 from music_sprite.pipeline import ImportResult
 from music_sprite.review import ReviewAction
+from music_sprite.staging import EntryStatus
 
 BIG_CREDITS = {f"role{i}": [f"Person {i}-{j}" for j in range(50)] for i in range(20)}
 NOISY_DESCRIPTION = "Line one\n@everyone buy my stuff\n" * 300
@@ -65,6 +67,16 @@ def heavy(make_entry):
     )
     # The LLM read the description, so the card shows all of it: several units.
     entry.review_note = "Downloaded 1 track(s)."
+    return entry
+
+
+@pytest.fixture
+def following(staging, make_entry):
+    """A looked-up track queued after `heavy`."""
+    entry = make_entry("ccccccc3")
+    entry.set_findings(Findings(upload=upload()))
+    entry.status = EntryStatus.RESOLVED
+    staging.save(entry)
     return entry
 
 
@@ -187,6 +199,7 @@ class FakeMessage:
 
     async def edit(self, view):
         self._log["edited"].append(self.id)
+        self._log["views"].append((self.id, view))
 
     async def delete(self):
         self._log["deleted"].append(self.id)
@@ -199,6 +212,7 @@ class FakeChannel:
     async def send(self, view):
         message = FakeMessage(self._log, next(self._counter))
         self._log["sent"].append(message.id)
+        self._log["views"].append((message.id, view))
         return message
 
     def get_partial_message(self, message_id):
@@ -220,7 +234,7 @@ def discord_bot(staging):
     )
     instance.app_emojis = Emojis()
     instance.staging = staging
-    instance.log = {"sent": [], "edited": [], "deleted": []}
+    instance.log = {"sent": [], "edited": [], "deleted": [], "views": []}
     instance.vanished = set()
     counter = itertools.count(100)
     instance.get_partial_messageable = lambda channel_id: FakeChannel(instance.log, counter, instance.vanished)
@@ -241,6 +255,17 @@ def click(bot, **data):
     interaction.response.defer = AsyncMock()
     interaction.response.edit_message = AsyncMock()
     interaction.edit_original_response = AsyncMock()
+    return interaction
+
+
+def click_card(bot, entry):
+    """Shows the entry's card, then clicks on its last message, where the actions are."""
+    bot.staging.save(entry)
+    run(bot.publish_review(entry, 555))
+    interaction = click(bot)
+    interaction.message.id, interaction.channel_id = entry.review_messages[-1], 555
+    bot.log["sent"].clear()
+    bot.log["views"].clear()
     return interaction
 
 
@@ -354,3 +379,36 @@ class TestPublishing:
         run(ReviewAction("discard", heavy.id).callback(interaction))
         assert discord_bot.staging.get(heavy.id) is None
         assert sorted(discord_bot.log["deleted"]) == sorted(set(heavy.review_messages) - {clicked})
+
+    @pytest.mark.parametrize("action", ["approve", "discard"])
+    def test_approving_or_discarding_opens_the_next_tracks_card_below(self, discord_bot, heavy, following, action):
+        discord_bot.pipeline.import_entry.return_value = ImportResult(upload(), path=Path("Tidal Pools/Low Tide.opus"))
+        run(ReviewAction(action, heavy.id).callback(click_card(discord_bot, heavy)))
+        fresh = discord_bot.staging.get(following.id)
+        assert fresh.review_channel == 555
+        assert fresh.review_messages and fresh.review_messages == discord_bot.log["sent"]
+        discord_bot.pipeline.resolve_entry.assert_not_awaited()
+
+    def test_a_next_track_never_looked_up_shows_its_lookup_where_its_card_appears(self, discord_bot, heavy, following):
+        following.status = EntryStatus.PENDING
+        discord_bot.staging.save(following)
+
+        async def resolve(entry, overwrite_edits=False, progress=None):
+            await progress(["MusicBrainz found Salt"], [])
+            entry.status = EntryStatus.RESOLVED
+            discord_bot.staging.save(entry)
+
+        discord_bot.pipeline.resolve_entry = AsyncMock(side_effect=resolve)
+        run(ReviewAction("discard", heavy.id).callback(click_card(discord_bot, heavy)))
+
+        progress = discord_bot.log["sent"][0]
+        shown = [texts(view)[0] for message_id, view in discord_bot.log["views"] if message_id == progress]
+        assert shown[0].startswith("**Looking up metadata** · ")
+        assert "MusicBrainz found Salt" in shown[1]
+        fresh = discord_bot.staging.get(following.id)
+        assert fresh.status == EntryStatus.RESOLVED and fresh.review_messages[0] == progress
+
+    def test_a_failed_import_stays_the_last_message(self, discord_bot, heavy, following):
+        run(ReviewAction("approve", heavy.id).callback(click_card(discord_bot, heavy)))
+        assert discord_bot.log["sent"] == []
+        assert discord_bot.staging.get(following.id).review_messages == []

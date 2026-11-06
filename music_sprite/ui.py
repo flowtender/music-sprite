@@ -113,6 +113,13 @@ def edit_status_of(interaction: discord.Interaction) -> Display:
     return display
 
 
+def edit_status_of_message(message: discord.Message) -> Display:
+    async def display(text: str) -> None:
+        await message.edit(view=status_view(text))
+
+    return display
+
+
 class ThrottledStatus:
     """A status message that is edited at most every few seconds unless forced, to stay clear of rate limits."""
 

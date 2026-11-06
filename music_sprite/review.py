@@ -31,7 +31,7 @@ from .reconcile import (
     Reconciled,
     field_value,
 )
-from .staging import QueueEntry
+from .staging import EntryStatus, QueueEntry
 from .ui import (
     STYLE,
     AllowedUsersOnly,
@@ -40,6 +40,7 @@ from .ui import (
     bot_of,
     container_view,
     edit_status_of,
+    edit_status_of_message,
     entry_label,
     escape,
     import_message,
@@ -457,6 +458,21 @@ def build_review_pages(entry: QueueEntry, emojis: Emojis, llm_description_chars:
 # --- buttons and editing --------------------------------------------------------------------------------------
 
 
+async def _review_next(interaction: discord.Interaction, done: QueueEntry) -> None:
+    """Shows the next track's card below the status `done` left, so a queue can be worked through card by card. A track
+    never looked up is looked up first, its progress shown in the message that then becomes its card."""
+    bot = bot_of(interaction)
+    entry = bot.staging.next_to_review(done)
+    if entry is None:
+        return
+    first = None
+    if entry.status == EntryStatus.PENDING:
+        channel = bot.get_partial_messageable(interaction.channel_id)
+        first = await channel.send(view=status_view(lookup_status(entry, 1, 1)))
+        await look_up(bot.pipeline, [entry], edit_status_of_message(first))
+    await bot.publish_review(entry, interaction.channel_id, first=first)
+
+
 class ReviewAction(
     AllowedUsersOnly, DynamicItem[Button], template=r"ms:r:(?P<action>approve|edit|lookup|close|discard):(?P<id>\w+)"
 ):
@@ -488,6 +504,9 @@ class ReviewAction(
             await bot.discard_review_pages(entry, keep=clicked.id)
             result = await bot.pipeline.import_entry(entry)
             await interaction.edit_original_response(view=status_view(import_message(result)))
+            # A failed import stays in the queue, and its error stays the last thing in the channel.
+            if result.added:
+                await _review_next(interaction, entry)
         elif self.action == "edit":
             entry.ensure_findings(bot.config.lookup.known_publishers)
             await interaction.response.send_modal(EditModal(entry))
@@ -500,6 +519,7 @@ class ReviewAction(
             await interaction.response.edit_message(view=status_view(f"Discarded **{escape(entry_label(entry))}**."))
             await bot.discard_review_pages(entry, keep=clicked.id)
             bot.staging.remove(entry)
+            await _review_next(interaction, entry)
         else:
             await interaction.response.edit_message(view=status_view(f"Closed. `{entry.id}` is still in the queue."))
             await bot.discard_review_pages(entry, keep=clicked.id)

@@ -215,6 +215,13 @@ class Staging:
         ]
         return sorted(entries, key=lambda entry: (entry.created_at, entry.id))
 
+    def next_to_review(self, after: QueueEntry) -> QueueEntry | None:
+        """The track whose card follows `after`'s once it has left the queue: the next one, wrapping around."""
+        waiting = [entry for entry in self.list() if entry.id != after.id]
+        position = (after.created_at, after.id)
+        later = (entry for entry in waiting if (entry.created_at, entry.id) > position)
+        return next(later, waiting[0] if waiting else None)
+
     def remove(self, entry: QueueEntry) -> None:
         shutil.rmtree(entry.directory, ignore_errors=True)
 

@@ -6,7 +6,7 @@ Discord bot: `/<name> download <url>` pulls audio with yt-dlp, tags it from seve
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e '.[test]'   # the full `analysis` extra is ~300 MB and not needed for tests
-.venv/bin/python -m pytest -q                                      # baseline: 115 pass (the ffmpeg-dependent test skips without ffmpeg)
+.venv/bin/python -m pytest -q                                      # baseline: 120 pass (the ffmpeg-dependent test skips without ffmpeg)
 ```
 
 - No linter or formatter is configured. Match the surrounding style; don't reformat code you aren't changing.
@@ -36,7 +36,7 @@ There is no MusicBrainz text search: without an AcoustID match (or without `ACOU
 | `pipeline.py` | The queue's work without Discord: download, look up, auto-import, import (`ImportResult`) |
 | `describe.py` | Plain-text descriptions of tracks shared by the lookup log and the review card |
 | `ui.py` | Discord pieces shared by the panels and the bot: escaping, status views, lookup progress, message limits and pagination |
-| `review.py`, `panels.py` | Review card and queue list. Both are 100% `DynamicItem`s; rendering is read-only, the callbacks call `QueueEntry`/`Pipeline`. Every value on the card carries its sources' emojis; conflicting fields get one button per value, tied releases a button each. Each queued track has its own Review (or Look up) button; Discard is on the card |
+| `review.py`, `panels.py` | Review card and queue list. Both are 100% `DynamicItem`s; rendering is read-only, the callbacks call `QueueEntry`/`Pipeline`. Every value on the card carries its sources' emojis; conflicting fields get one button per value, tied releases a button each. Each queued track has its own Review (or Look up) button; Discard is on the card. Approve (when the import succeeds) and Discard post the next track's card (`Staging.next_to_review`), looking it up first, with progress, if it never was |
 | `emojis.py` | Source emojis: `sync` uploads `music_sprite/assets/*.png` as application emojis at startup (by name, never replacing one); `Emojis.sources` maps each source to its emoji, the upload's being its site's (named after the yt-dlp extractor, e.g. `youtube.png`), with plain emojis for any missing |
 | `bot.py` | The Discord client: slash commands, the download command's progress message, review message lifecycle |
 | `config.py` | `Config.from_env()`: one frozen section per consumer (`discord`, `queue`, `library`, `lookup`, `analysis`, `llm`); every setting is an env var |
