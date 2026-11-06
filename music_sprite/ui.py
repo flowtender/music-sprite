@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import discord
-from discord.ui import ActionRow, Container, DynamicItem, LayoutView, TextDisplay
+from discord.ui import ActionRow, Button, Container, DynamicItem, LayoutView, Section, TextDisplay
 
 from . import describe
 from .pipeline import ImportResult, Pipeline
@@ -20,7 +20,6 @@ if TYPE_CHECKING:
 MAX_COMPONENTS = 40
 MAX_INTERACTIVE = 30
 MAX_TEXT = 4000
-MAX_SELECT_OPTIONS = 25
 
 STYLE = discord.ButtonStyle
 ACCENT_BY_CONFIDENCE = ((0.85, discord.Colour.green()), (0.5, discord.Colour.gold()))
@@ -133,14 +132,15 @@ class ThrottledStatus:
 
 @dataclass
 class Unit:
-    """One piece of a long card: its text, then optionally the row of controls (a drop-down or buttons) for it."""
+    """One piece of a long card: its text, then optionally the row of buttons for it, or one button beside it."""
 
     text: str
     row: ActionRow | None = None
+    accessory: Button | DynamicItem | None = None
 
     @property
     def interactive(self) -> int:
-        return len(self.row.children) if self.row else 0
+        return len(self.row.children) if self.row else 1 if self.accessory else 0
 
 
 class _Page:
@@ -151,21 +151,34 @@ class _Page:
         self.text = text
         self.interactive = 0
 
+    def _added(self, unit: Unit) -> tuple[int, int]:
+        """The components and text the unit would add: a section of its own, or lines of the text being gathered."""
+        if unit.accessory:
+            return 3, len(unit.text)  # the section, its text and the button
+        components = (0 if self._lines else 1) + (1 + unit.interactive if unit.row else 0)
+        return components, len(unit.text) + (1 if self._lines else 0)
+
     def fits(self, unit: Unit) -> bool:
-        components = self.components + (0 if self._lines else 1) + (1 + unit.interactive if unit.row else 0)
-        text = self.text + len(unit.text) + (1 if self._lines else 0)
-        interactive = self.interactive + unit.interactive
-        return components <= MAX_COMPONENTS and text <= MAX_TEXT and interactive <= MAX_INTERACTIVE
+        components, text = self._added(unit)
+        return (
+            self.components + components <= MAX_COMPONENTS
+            and self.text + text <= MAX_TEXT
+            and self.interactive + unit.interactive <= MAX_INTERACTIVE
+        )
 
     def add(self, unit: Unit) -> None:
-        self.components += 0 if self._lines else 1
-        self.text += len(unit.text) + (1 if self._lines else 0)
+        components, text = self._added(unit)
+        self.components += components
+        self.text += text
+        self.interactive += unit.interactive
+        if unit.accessory:
+            self.flush()
+            self.children.append(Section(TextDisplay(unit.text), accessory=unit.accessory))
+            return
         self._lines.append(unit.text)
         if unit.row:
             self.flush()
             self.children.append(unit.row)
-            self.components += 1 + unit.interactive
-            self.interactive += unit.interactive
 
     def flush(self) -> None:
         if self._lines:

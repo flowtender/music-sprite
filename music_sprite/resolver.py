@@ -13,7 +13,6 @@ from .analysis import AnalysisError, Analyzer
 from .llm import LlmClient
 from .models import AudioFeatures, Findings, LlmVerdict, LookupUnavailable, TrackMetadata
 from .musicbrainz import MusicBrainzClient
-from .reconcile import ambiguous_fields
 
 log = logging.getLogger(__name__)
 
@@ -200,22 +199,20 @@ class MetadataResolver:
         return features
 
     async def _ask_llm(self, info: dict, findings: Findings, steps: _Steps) -> LlmVerdict | None:
-        asked = ambiguous_fields(findings)
         if not self._llm.enabled:
             await steps.add("LLM: skipped (LLM_MODEL not set)")
             return None
-        if not asked:
-            await steps.add("LLM: skipped (the other sources leave nothing ambiguous)")
-            return None
-        async with steps.working(f"Asking the LLM about {', '.join(asked)}"):
+        async with steps.working("Asking the LLM about every field"):
             try:
-                verdict = await self._llm.resolve(info, findings, asked)
+                verdict = await self._llm.resolve(info, findings)
             except LookupUnavailable as error:
                 await steps.unavailable(error, "LLM: unavailable")
                 return None
-        answers = " · ".join(f"{name} {value}" for name, value in verdict.answers.items())
+        answers = " · ".join(
+            f"{name} {', '.join(value) if isinstance(value, list) else value}" for name, value in verdict.answers.items()
+        )
         await steps.add(
-            f"LLM ({verdict.model}, asked {', '.join(asked)}): {answers or 'nothing in the information answers it'}"
+            f"LLM ({verdict.model}): {answers or 'nothing in the information answers it'}"
             f" · confidence {verdict.confidence:.0%}" + (f" · {verdict.reasoning}" if verdict.reasoning else "")
         )
         return verdict

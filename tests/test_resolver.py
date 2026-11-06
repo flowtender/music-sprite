@@ -6,7 +6,7 @@ import httpx
 import pytest
 from conftest import llm_config, release
 
-from music_sprite.llm import LlmClient
+from music_sprite.llm import ANSWER_KEYS, LlmClient
 from music_sprite.models import AudioFeatures, Choices, LookupUnavailable
 from music_sprite.reconcile import reconcile
 from music_sprite.resolver import MetadataResolver
@@ -70,8 +70,7 @@ def resolve(*, acoustid=None, musicbrainz=None, analyzer=None, llm_reply=None, i
 
     def handler(request):
         requests.append(json.loads(json.loads(request.content)["messages"][1]["content"]))
-        answer = {"reasoning": "r", "title": None, "artist": None, "album": None, "album_artist": None,
-                  "year": None, "release": None, "confidence": 0.8, **(llm_reply or {})}
+        answer = {"reasoning": "r", **{name: None for name in ANSWER_KEYS}, "confidence": 0.8, **(llm_reply or {})}
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(answer)}}]})
 
     async def run():
@@ -95,20 +94,19 @@ def test_identification_and_analysis_run_side_by_side():
     assert [r.musicbrainz.recording_id for r in resolution.findings.releases] == ["rec1"]
 
 
-def test_the_llm_is_skipped_when_nothing_is_ambiguous():
+def test_the_llm_is_asked_even_when_the_other_sources_agree():
     info = {**INFO, "artist": "Tidal Pools", "track": "Low Tide"}  # source tags: confidence 0.9, matches MusicBrainz
-    resolution, requests = resolve(info=info)
-    assert requests == [] and resolution.findings.llm is None
+    resolution, requests = resolve(info=info, llm_reply={"title": "Low Tide", "track_number": 3})
+    assert len(requests) == 1 and requests[0]["upload"]["track"] == "Low Tide"
+    assert resolution.findings.llm.answers == {"title": "Low Tide", "track_number": 3}
 
 
-def test_the_llm_is_asked_only_about_ambiguous_fields_and_cannot_override_the_rest():
-    # The upload says "Low Tide (Official)" while MusicBrainz says "Low Tide": only the title is in dispute.
-    info = {**INFO, "title": "Tidal Pools - Low Tide (Official Audio) feat", "artist": "Tidal Pools", "track": "Low Tide (feat)"}
-    resolution, requests = resolve(info=info, llm_reply={"title": "Low Tide", "artist": "Impostor", "album": "Nope"})
-    assert requests[0]["ask"] == ["title"]
-    assert resolution.findings.llm.answers == {"title": "Low Tide"}
-    metadata = reconcile(resolution.findings, Choices()).metadata
-    assert (metadata.artist, metadata.album) == ("Tidal Pools", "Salt")
+def test_the_llms_differing_answers_become_choices_and_do_not_override_musicbrainz():
+    resolution, _ = resolve(llm_reply={"title": "Low Tide", "artist": "Impostor", "album": "Nope"})
+    result = reconcile(resolution.findings, Choices())
+    assert (result.metadata.artist, result.metadata.album) == ("Tidal Pools", "Salt")
+    assert [candidate.sources for candidate in result.fields["artist"].candidates] == [["musicbrainz", "upload"], ["llm"]]
+    assert result.fields["album"].conflicted
 
 
 @pytest.mark.parametrize(

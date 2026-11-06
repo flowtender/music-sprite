@@ -150,12 +150,12 @@ SOURCE_LABELS = {"essentia": "Essentia", "musicbrainz": "MusicBrainz", "llm": "L
 
 @dataclass
 class LlmVerdict:
-    """The LLM's answers for the fields the other sources could not settle."""
+    """The LLM's own reading of every field, from everything the other sources found."""
 
     model: str
-    asked: list[str] = field(default_factory=list)
-    # Asked field -> answer; a field the LLM found no evidence for is absent. "release" is an index into releases.
-    answers: dict[str, str | int] = field(default_factory=dict)
+    # Field -> answer; a field the information says nothing about is absent. "release" is an index into releases;
+    # "genres" and the credits (composer, ...) are lists of names.
+    answers: dict[str, str | int | list[str]] = field(default_factory=dict)
     reasoning: str = ""
     confidence: float = 0.0
 
@@ -181,7 +181,8 @@ class Findings:
             upload=TrackMetadata.from_dict(data["upload"]),
             releases=[TrackMetadata.from_dict(release) for release in data.get("releases", [])],
             audio=AudioFeatures(**audio) if audio else None,
-            llm=LlmVerdict(**llm) if llm else None,
+            # Entries saved while the LLM was only asked about some fields list them under "asked".
+            llm=LlmVerdict(**{key: value for key, value in llm.items() if key != "asked"}) if llm else None,
         )
 
 

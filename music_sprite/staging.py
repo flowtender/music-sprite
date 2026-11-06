@@ -105,9 +105,10 @@ class QueueEntry:
         if self.findings is None or not valid_index(index, len(self.findings.releases)):
             return False
         self.choices.release = index
-        # Album, album artist and year belong to the release that was just replaced.
+        # Every field but title and artist belongs to the release that was just replaced.
         for name in RELEASE_FIELDS:
             self.choices.manual.pop(name, None)
+            self.choices.fields.pop(name, None)
         self.refresh_meta()
         return True
 

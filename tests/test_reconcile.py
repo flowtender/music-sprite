@@ -3,11 +3,11 @@ import json
 from conftest import release, upload
 
 from music_sprite.models import AudioFeatures, Choices, Findings, LlmVerdict
-from music_sprite.reconcile import ambiguous_fields, reconcile
+from music_sprite.reconcile import reconcile
 
 
-def verdict(answers, asked=None, confidence=0.9) -> LlmVerdict:
-    return LlmVerdict("m", asked or list(answers), answers, "because", confidence)
+def verdict(answers, confidence=0.9) -> LlmVerdict:
+    return LlmVerdict("m", answers, "because", confidence)
 
 
 class TestPrecedence:
@@ -49,19 +49,28 @@ class TestPrecedence:
 
 
 class TestRelease:
-    def test_release_fields_come_from_one_release_even_if_the_upload_disagrees(self):
-        findings = Findings(upload=upload(album="Other", year=1999), releases=[release(album="Salt", year=2021)])
+    def test_release_fields_come_from_the_release_unless_another_sources_value_is_picked(self):
+        findings = Findings(upload=upload(album="Other", year=1999), releases=[release(album="Salt", year=2021)],
+                            llm=verdict({"track_number": 5}))
         result = reconcile(findings, Choices())
-        assert (result.metadata.album, result.metadata.year) == ("Salt", 2021)
-        assert not result.fields["album"].selectable and not result.fields["year"].selectable
-        # the upload's value stays visible for comparison
+        assert (result.metadata.album, result.metadata.year, result.metadata.release.track_number) == ("Salt", 2021, 3)
         assert [c.sources for c in result.fields["album"].candidates] == [["musicbrainz"], ["upload"]]
+        assert result.fields["album"].conflicted and result.fields["track_number"].conflicted
+        picked = reconcile(findings, Choices(fields={"album": "upload", "track_number": "llm"})).metadata
+        assert (picked.album, picked.release.track_number, picked.release.label) == ("Other", 5, "Label Co")
+
+    def test_a_year_from_another_source_drops_the_release_date_that_would_be_tagged_instead(self):
+        findings = Findings(upload=upload(year=1999), releases=[release(year=2021)])
+        assert reconcile(findings, Choices()).metadata.release.release_date == "2021-05-01"
+        for choices in (Choices(fields={"year": "upload"}), Choices(manual={"year": 1999})):
+            metadata = reconcile(findings, choices).metadata
+            assert (metadata.year, metadata.release.release_date, metadata.release.original_date) == (1999, None, "2019")
 
     def test_without_a_release_album_and_year_are_chosen_per_field(self):
         findings = Findings(upload=upload(album="Salt", year=2020), llm=verdict({"album": "Salt EP", "year": 2021}))
         result = reconcile(findings, Choices(fields={"year": "upload"}))
         assert (result.metadata.album, result.metadata.year) == ("Salt EP", 2020)
-        assert result.conflicts == ["album", "year"]
+        assert [name for name, report in result.fields.items() if report.conflicted] == ["album", "year"]
 
     def test_ties_are_resolved_by_user_then_llm_then_rank(self):
         releases = [release(album="Best of", year=2023, recording="a"), release(album="Salt", year=2021, recording="b"),
@@ -71,7 +80,7 @@ class TestRelease:
         findings.llm = verdict({"release": 1})
         assert reconcile(findings, Choices()).metadata.album == "Salt"
         assert reconcile(findings, Choices(release=2)).metadata.album == "Live"
-        assert reconcile(findings, Choices()).conflicts == ["release"]
+        assert reconcile(findings, Choices()).release_conflicted
 
     def test_out_of_range_picks_fall_back(self):
         findings = Findings(upload=upload(), releases=[release(album="A"), release(album="B", recording="b")],
@@ -111,32 +120,26 @@ class TestManualEdits:
         assert (result.metadata.title, result.metadata.artist) == ("Mine", "A")
 
 
-class TestAmbiguity:
-    def test_nothing_is_asked_when_a_match_and_the_upload_agree(self):
-        findings = Findings(upload=upload(), releases=[release()])
-        assert ambiguous_fields(findings) == []
+class TestLlmGuesses:
+    def test_without_a_release_the_llms_track_number_label_and_credits_are_tagged(self):
+        guesses = {"track_number": 7, "track_total": 9, "label": "Driftwood", "catalog_number": "DW012",
+                   "composer": ["Ana Reyes"]}
+        release_info = reconcile(Findings(upload=upload(), llm=verdict(guesses)), Choices()).metadata.release
+        assert (release_info.track_number, release_info.track_total) == (7, 9)
+        assert (release_info.label, release_info.catalog_number) == ("Driftwood", "DW012")
+        assert release_info.credits == {"composer": ["Ana Reyes"]}
 
-    def test_a_guess_from_the_upload_alone_is_asked_unless_the_site_stated_it(self):
-        guessed = Findings(upload=upload(confidence=0.5), releases=[])
-        stated = Findings(upload=upload(confidence=0.9), releases=[])
-        assert {"title", "artist"} <= set(ambiguous_fields(guessed))
-        assert not {"title", "artist"} & set(ambiguous_fields(stated))
+    def test_a_credit_is_taken_whole_from_one_source_and_the_releases_other_credits_stay(self):
+        match = release(credits={"composer": ["Kim Shore"], "engineer": ["Lee Park"]})
+        findings = Findings(upload=upload(), releases=[match], llm=verdict({"composer": ["Ana Reyes", "Kim Shore"]}))
+        assert reconcile(findings, Choices()).metadata.release.credits["composer"] == ["Kim Shore"]
+        picked = reconcile(findings, Choices(fields={"composer": "llm"})).metadata.release.credits
+        assert picked == {"engineer": ["Lee Park"], "composer": ["Ana Reyes", "Kim Shore"]}
 
-    def test_a_missing_artist_is_asked(self):
-        assert "artist" in ambiguous_fields(Findings(upload=upload(artist="", confidence=0.1)))
-
-    def test_disagreement_and_release_ties_are_asked(self):
-        findings = Findings(upload=upload(title="Low Tide (Official)"),
-                            releases=[release(), release(album="B", recording="b")])
-        assert ambiguous_fields(findings) == ["title", "release"]
-
-    def test_album_and_year_are_asked_only_without_a_release(self):
-        assert {"album", "year"} <= set(ambiguous_fields(Findings(upload=upload())))
-        assert not {"album", "year"} & set(ambiguous_fields(Findings(upload=upload(), releases=[release()])))
-
-    def test_the_llms_answers_are_ignored(self):
-        findings = Findings(upload=upload(confidence=0.5), llm=verdict({"title": "x", "artist": "y"}))
-        assert {"title", "artist"} <= set(ambiguous_fields(findings))
+    def test_the_llms_genres_join_the_others(self):
+        audio = AudioFeatures(bpm=1, key="x", genres=[("Techno", 0.5)])
+        findings = Findings(upload=upload(genres=["electronic"]), audio=audio, llm=verdict({"genres": ["Acid Techno", "techno"]}))
+        assert reconcile(findings, Choices()).metadata.genres == ["Techno", "Acid Techno", "electronic"]
 
 
 def test_findings_and_choices_survive_json():
@@ -144,7 +147,7 @@ def test_findings_and_choices_survive_json():
         upload=upload(genres=["x"]),
         releases=[release(credits={"composer": ["A"]})],
         audio=AudioFeatures(bpm=1, key="k", genres=[("Techno", 0.5)]),
-        llm=verdict({"title": "t", "release": 0}),
+        llm=verdict({"title": "t", "release": 0, "composer": ["A", "B"]}),
     )
     choices = Choices(release=0, fields={"artist": "llm"}, manual={"year": 1})
     back_findings = Findings.from_dict(json.loads(json.dumps(findings.to_dict())))
@@ -154,3 +157,9 @@ def test_findings_and_choices_survive_json():
     assert reconcile(back_findings, back_choices).metadata.to_dict() == json.loads(
         json.dumps(reconcile(findings, choices).metadata.to_dict())
     )
+
+
+def test_findings_saved_when_the_llm_was_asked_about_some_fields_only_still_load():
+    saved = {"upload": upload().to_dict(), "llm": {"model": "m", "asked": ["title"], "answers": {"title": "t"},
+                                                   "reasoning": "r", "confidence": 0.5}}
+    assert Findings.from_dict(saved).llm == LlmVerdict("m", {"title": "t"}, "r", 0.5)

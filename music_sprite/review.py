@@ -2,9 +2,10 @@
 actions.
 
 Each value is followed by the emoji of every source that gave it (emojis.py); a field whose sources disagree shows
-the value that will be tagged first and the other sources' values after it. Every interactive item is a DynamicItem
-whose custom_id carries what it needs (queue entry id, field, source), and the state itself lives in the queue entry
-on disk, so the card keeps working after the bot restarts.
+the value that will be tagged first and the other sources' values after it, with one button per value, and equally
+good releases get a button each. There are no drop-downs. Every interactive item is a DynamicItem whose custom_id
+carries what it needs (queue entry id, field, source), and the state itself lives in the queue entry on disk, so the
+card keeps working after the bot restarts.
 
 A message holds at most 40 components (30 of them interactive) and 4000 characters of text, and a track with credits
 and a long upload description needs more than that, so the card is split over several messages. Fields are packed in
@@ -15,15 +16,23 @@ release brings its album, date, label, ...), so every message of the card is re-
 import re
 
 import discord
-from discord.ui import ActionRow, Button, DynamicItem, LayoutView, Section, Select, Separator, TextDisplay, Thumbnail
+from discord.ui import ActionRow, Button, DynamicItem, LayoutView, Section, Separator, TextDisplay, Thumbnail
 
 from . import describe
 from .emojis import Emojis
 from .models import AudioFeatures, LlmVerdict, TrackMetadata
-from .reconcile import CHOOSABLE_FIELDS, FIELDS, RELEASE, RELEASE_FIELDS, Candidate, FieldReport, Reconciled
+from .reconcile import (
+    CREDIT_FIELDS,
+    RELEASE,
+    RELEASE_FIELDS,
+    TRACK_FIELDS,
+    Candidate,
+    FieldReport,
+    Reconciled,
+    field_value,
+)
 from .staging import QueueEntry
 from .ui import (
-    MAX_SELECT_OPTIONS,
     STYLE,
     AllowedUsersOnly,
     Unit,
@@ -31,6 +40,7 @@ from .ui import (
     bot_of,
     container_view,
     edit_status_of,
+    entry_label,
     escape,
     import_message,
     look_up,
@@ -44,7 +54,6 @@ from .ui import (
 # Room left on every page for its "page 2/3" tag, which is only known once the pages are counted.
 PAGE_TAG_MARGIN = 40
 UNIT_MAX_CHARS = 1500
-MAX_SHOWN_RELEASES = 6
 # A description the LLM didn't read is only context for the reader, so a preview does.
 DESCRIPTION_PREVIEW_CHARS = 600
 # Description lines are cut this short before escaping, which can double their length, so one fits in a unit.
@@ -57,10 +66,25 @@ REVIEW_ACTIONS = {
     "edit": ("Edit", STYLE.primary),
     "lookup": ("Re-lookup", STYLE.secondary),
     "close": ("Close", STYLE.secondary),
+    "discard": ("Discard", STYLE.danger),
 }
 ACTIONS_COMPONENTS = 1 + 1 + len(REVIEW_ACTIONS)  # separator, row, buttons
-LABELS = {"title": "Title", "artist": "Artist", "album": "Album", "album_artist": "Album artist", "year": "Year"}
-CHOSEN, OTHER = "✅", "▫️"
+LABELS = {
+    "title": "Title",
+    "artist": "Artist",
+    "album": "Album",
+    "album_artist": "Album artist",
+    "year": "Year",
+    "track_number": "Track",
+    "track_total": "Tracks on the album",
+    "label": "Label",
+    "catalog_number": "Catalog number",
+    "composer": "Composer",
+    "lyricist": "Lyricist",
+    "producer": "Producer",
+}
+# Shown even when no source has a value; the other fields only when one does.
+ALWAYS_SHOWN = ("title", "artist", "album", "year")
 EDITED = "✏️"
 # Between the value that will be tagged and those of the sources that disagree with it.
 DISAGREES = " ≠ "
@@ -68,13 +92,16 @@ DISAGREES = " ≠ "
 Marks = dict[str, str]  # source -> its emoji, as message markup
 
 
-def _value(value: object, limit: int = UNIT_MAX_CHARS) -> str:
-    shown = ", ".join(map(str, value)) if isinstance(value, (list, tuple)) else value
-    return escape(truncate(str(shown), limit)) if shown not in (None, "") else "*none*"
-
-
 def _found(value: object) -> bool:
     return value not in (None, "", [], ())
+
+
+def _plain(value: object) -> str:
+    return ", ".join(map(str, value)) if isinstance(value, (list, tuple)) else str(value)
+
+
+def _value(value: object, limit: int = UNIT_MAX_CHARS) -> str:
+    return escape(truncate(_plain(value), limit)) if _found(value) else "*none*"
 
 
 def _field(label: str, value: object, mark: str = "") -> str:
@@ -91,7 +118,7 @@ def _mark(candidate: Candidate, marks: Marks) -> str:
     return "".join(marks[source] for source in candidate.sources)
 
 
-# --- buttons and drop-downs for the choices -------------------------------------------------------------------
+# --- buttons for the choices ----------------------------------------------------------------------------------
 
 
 async def gone(interaction: discord.Interaction) -> None:
@@ -140,50 +167,29 @@ class FieldPick(
         await _pick_field(interaction, self.entry_id, self.name, self.source)
 
 
-class FieldSelect(AllowedUsersOnly, DynamicItem[Select], template=r"ms:r:field:(?P<id>\w+):(?P<field>\w+)"):
-    """The drop-down that FieldPick replaced. Cards posted before still have it; a pick re-renders them with buttons."""
+class ReleasePick(
+    AllowedUsersOnly, DynamicItem[Button], template=r"ms:r:release:(?P<id>\w+):(?P<index>\d+)"
+):
+    """The button beside one of the equally good releases; the current choice is highlighted."""
 
-    def __init__(self, entry_id: str, name: str, options: list[discord.SelectOption]):
+    def __init__(self, entry_id: str, index: int, chosen: bool):
         super().__init__(
-            Select(
-                placeholder=f"Choose the {LABELS[name].lower()}…",
-                min_values=1,
-                max_values=1,
-                options=options,
-                custom_id=f"ms:r:field:{entry_id}:{name}",
+            Button(
+                label="Chosen" if chosen else "Choose",
+                style=STYLE.primary if chosen else STYLE.secondary,
+                custom_id=f"ms:r:release:{entry_id}:{index}",
             )
         )
         self.entry_id = entry_id
-        self.name = name
+        self.index = index
 
     @classmethod
-    async def from_custom_id(cls, interaction: discord.Interaction, item: Select, match: re.Match[str]):
-        return cls(match["id"], match["field"], unwrap(item).options)
-
-    async def callback(self, interaction: discord.Interaction):
-        await _pick_field(interaction, self.entry_id, self.name, interaction.data["values"][0])
-
-
-class ReleaseSelect(AllowedUsersOnly, DynamicItem[Select], template=r"ms:r:release:(?P<id>\w+)"):
-    def __init__(self, entry_id: str, options: list[discord.SelectOption]):
-        super().__init__(
-            Select(
-                placeholder="Choose the release…",
-                min_values=1,
-                max_values=1,
-                options=options,
-                custom_id=f"ms:r:release:{entry_id}",
-            )
-        )
-        self.entry_id = entry_id
-
-    @classmethod
-    async def from_custom_id(cls, interaction: discord.Interaction, item: Select, match: re.Match[str]):
-        return cls(match["id"], unwrap(item).options)
+    async def from_custom_id(cls, interaction: discord.Interaction, item: Button, match: re.Match[str]):
+        return cls(match["id"], int(match["index"]), unwrap(item).style == STYLE.primary)
 
     async def callback(self, interaction: discord.Interaction):
         entry = bot_of(interaction).staging.get(self.entry_id)
-        if entry is None or not entry.pick_release(int(interaction.data["values"][0])):
+        if entry is None or not entry.pick_release(self.index):
             await gone(interaction)
             return
         await _choice_made(interaction, entry)
@@ -197,26 +203,13 @@ def _field_buttons(entry_id: str, report: FieldReport, marks: Marks) -> ActionRo
                 entry_id,
                 report.name,
                 candidate.sources[0],
-                truncate(str(candidate.value), MAX_BUTTON_LABEL),
+                truncate(_plain(candidate.value), MAX_BUTTON_LABEL),
                 marks[candidate.sources[0]],
                 index == report.chosen and not report.manual,
             )
             for index, candidate in enumerate(report.candidates)
         )
     )
-
-
-def _release_select(entry_id: str, reconciled: Reconciled) -> ActionRow:
-    options = [
-        discord.SelectOption(
-            label=truncate(describe.release_name(release), 100),
-            value=str(index),
-            description=truncate(f"{release.year or '?'} · {describe.artist_title(release)}", 100),
-            default=index == reconciled.release_index,
-        )
-        for index, release in enumerate(reconciled.releases[:MAX_SELECT_OPTIONS])
-    ]
-    return ActionRow(ReleaseSelect(entry_id, options))
 
 
 # --- the fields -----------------------------------------------------------------------------------------------
@@ -236,13 +229,14 @@ def _field_unit(entry_id: str, report: FieldReport, final: object, marks: Marks)
     return Unit(text, _field_buttons(entry_id, report, marks) if report.conflicted else None)
 
 
-def _release_unit(entry_id: str, reconciled: Reconciled, llm_pick: object, marks: Marks) -> Unit | None:
-    """The choice between equally good releases; a single match needs no choice and shows up in the details."""
+def _release_units(entry_id: str, reconciled: Reconciled, llm_pick: object, marks: Marks) -> list[Unit]:
+    """The choice between equally good releases, a button beside each; a single match needs no choice and shows up
+    in the details."""
     if not reconciled.release_conflicted:
-        return None
+        return []
     releases = reconciled.releases
-    lines = [f"**Release** {marks['musicbrainz']} · {len(releases)} equally good matches, pick one:"]
-    for index, option in enumerate(releases[:MAX_SHOWN_RELEASES]):
+    units = [Unit(f"**Release** {marks['musicbrainz']} · {len(releases)} equally good matches, pick one:")]
+    for index, option in enumerate(releases):
         date = option.release.release_date or option.year
         position = describe.track_position(option)
         extras = [
@@ -253,16 +247,15 @@ def _release_unit(entry_id: str, reconciled: Reconciled, llm_pick: object, marks
             option.release.country,
         ]
         album = escape(truncate(describe.release_name(option), 120))
-        lines.append(
-            f"{CHOSEN if index == reconciled.release_index else OTHER} **{album}**"
+        text = (
+            f"**{album}**"
             + (f" ({date})" if date else "")
             + (f" {marks['llm']}" if index == llm_pick else "")
+            + "\n-# "
+            + escape(" · ".join(extra for extra in extras if extra))
         )
-        lines.append("-# " + escape(" · ".join(extra for extra in extras if extra)))
-    hidden = len(releases) - MAX_SHOWN_RELEASES
-    if hidden > 0:
-        lines.append(f"-# …and {hidden} more in the drop-down")
-    return Unit("\n".join(lines), _release_select(entry_id, reconciled))
+        units.append(Unit(text, accessory=ReleasePick(entry_id, index, index == reconciled.release_index)))
+    return units
 
 
 def _release_details(meta: TrackMetadata, mark: str) -> str:
@@ -272,8 +265,9 @@ def _release_details(meta: TrackMetadata, mark: str) -> str:
         _optional_field(
             "Original date", release.original_date if release.original_date != release.release_date else None, mark
         ),
-        _optional_field("Track", describe.track_position(meta), mark),
-        _optional_field("Label", describe.label(meta), mark),
+        _optional_field(
+            "Disc", f"{release.disc_number}/{release.disc_total}" if (release.disc_total or 0) > 1 else None, mark
+        ),
         _optional_field("Barcode", release.barcode, mark),
         _optional_field("Country", release.country, mark),
         _optional_field(
@@ -318,8 +312,11 @@ def _genres_field(reconciled: Reconciled, edited: bool, marks: Marks) -> str:
 
 
 def _credits_unit(meta: TrackMetadata, mark: str) -> str:
+    """The credits that are not fields of their own (composer, lyricist and producer are), as MusicBrainz has them."""
     return "\n".join(
-        _field(role.capitalize(), truncate(", ".join(names), 300), mark) for role, names in meta.release.credits.items()
+        _field(role.capitalize(), truncate(", ".join(names), 300), mark)
+        for role, names in meta.release.credits.items()
+        if role not in CREDIT_FIELDS
     )
 
 
@@ -374,10 +371,7 @@ def _llm_line(verdict: LlmVerdict | None, mark: str) -> str | None:
     if verdict is None:
         return None
     reasoning = escape(truncate(verdict.reasoning, REASONING_CHARS)) if verdict.reasoning else "no reasoning given"
-    return (
-        f"-# {mark} {escape(verdict.model)}, asked about {', '.join(verdict.asked)}: {reasoning}"
-        f" · confidence {verdict.confidence:.0%}"
-    )
+    return f"-# {mark} {escape(verdict.model)}: {reasoning} · confidence {verdict.confidence:.0%}"
 
 
 def build_units(entry: QueueEntry, reconciled: Reconciled, marks: Marks, llm_description_chars: int) -> list[Unit]:
@@ -389,18 +383,15 @@ def build_units(entry: QueueEntry, reconciled: Reconciled, marks: Marks, llm_des
         if text:
             units.append(Unit(truncate(text, UNIT_MAX_CHARS)))
 
-    values = {name: getattr(meta, name) for name in FIELDS}
     if entry.resolve_error:
         add(f"⚠️ {escape(entry.resolve_error)}")
-    for name in CHOOSABLE_FIELDS:
-        units.append(_field_unit(entry.id, reconciled.fields[name], values[name], marks))
-    if release := _release_unit(entry.id, reconciled, llm.answers.get(RELEASE) if llm else None, marks):
-        units.append(release)
+    for name in TRACK_FIELDS:
+        units.append(_field_unit(entry.id, reconciled.fields[name], field_value(meta, name), marks))
+    units.extend(_release_units(entry.id, reconciled, llm.answers.get(RELEASE) if llm else None, marks))
     for name in RELEASE_FIELDS:
         report = reconciled.fields[name]
-        if name == "album_artist" and not report.candidates and not report.manual:
-            continue
-        units.append(_field_unit(entry.id, report, values[name], marks))
+        if name in ALWAYS_SHOWN or report.candidates or report.manual:
+            units.append(_field_unit(entry.id, report, field_value(meta, name), marks))
     add(_release_details(meta, marks["musicbrainz"]))
     add(_genres_field(reconciled, "genres" in entry.choices.manual, marks))
     add(_credits_unit(meta, marks["musicbrainz"]))
@@ -466,7 +457,9 @@ def build_review_pages(entry: QueueEntry, emojis: Emojis, llm_description_chars:
 # --- buttons and editing --------------------------------------------------------------------------------------
 
 
-class ReviewAction(AllowedUsersOnly, DynamicItem[Button], template=r"ms:r:(?P<action>approve|edit|lookup|close):(?P<id>\w+)"):
+class ReviewAction(
+    AllowedUsersOnly, DynamicItem[Button], template=r"ms:r:(?P<action>approve|edit|lookup|close|discard):(?P<id>\w+)"
+):
     def __init__(self, action: str, entry_id: str):
         label, style = REVIEW_ACTIONS[action]
         super().__init__(Button(label=label, style=style, custom_id=f"ms:r:{action}:{entry_id}"))
@@ -503,6 +496,10 @@ class ReviewAction(AllowedUsersOnly, DynamicItem[Button], template=r"ms:r:(?P<ac
             await bot.discard_review_pages(entry, keep=clicked.id)
             await look_up(bot.pipeline, [entry], edit_status_of(interaction), overwrite_edits=True)
             await bot.publish_review(entry, interaction.channel_id, first=clicked)
+        elif self.action == "discard":
+            await interaction.response.edit_message(view=status_view(f"Discarded **{escape(entry_label(entry))}**."))
+            await bot.discard_review_pages(entry, keep=clicked.id)
+            bot.staging.remove(entry)
         else:
             await interaction.response.edit_message(view=status_view(f"Closed. `{entry.id}` is still in the queue."))
             await bot.discard_review_pages(entry, keep=clicked.id)
@@ -541,4 +538,4 @@ class EditModal(discord.ui.Modal, title="Edit metadata"):
         await _choice_made(interaction, self.entry)
 
 
-DYNAMIC_ITEMS = (ReviewAction, FieldPick, FieldSelect, ReleaseSelect)
+DYNAMIC_ITEMS = (ReviewAction, FieldPick, ReleasePick)

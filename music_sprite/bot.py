@@ -37,7 +37,7 @@ class QueueCommands(app_commands.Group):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await self.bot.ensure_allowed(interaction)
 
-    @app_commands.command(name="list", description="Show downloaded tracks; select some to review, look up or discard")
+    @app_commands.command(name="list", description="Show downloaded tracks, each with a button to review or look it up")
     async def list_queue(self, interaction: discord.Interaction):
         await interaction.response.send_message(view=build_queue_view(self.bot))
 

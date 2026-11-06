@@ -5,21 +5,20 @@ import httpx
 import pytest
 from conftest import llm_config, release, upload
 
-from music_sprite.llm import LlmClient, trim_upload
+from music_sprite.llm import ANSWER_KEYS, LlmClient, trim_upload
 from music_sprite.models import AudioFeatures, Findings, LookupUnavailable
 
 
 def reply(**fields):
-    answer = {"reasoning": "r", "title": None, "artist": None, "album": None, "album_artist": None,
-              "year": None, "release": None, "confidence": 0.8, **fields}
+    answer = {"reasoning": "r", **{name: None for name in ANSWER_KEYS}, "confidence": 0.8, **fields}
     return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(answer)}}], "usage": {}})
 
 
-def resolve(findings, asked, handler, info=None):
+def resolve(findings, handler, info=None):
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
             client = LlmClient(http, llm_config(), frozenset({"epic network"}))
-            return await client.resolve(info or {"title": "t"}, findings, asked)
+            return await client.resolve(info or {"title": "t"}, findings)
 
     return asyncio.run(run())
 
@@ -43,7 +42,7 @@ class TestTrimUpload:
 
 
 class TestRequest:
-    def test_the_model_sees_the_whole_blob_and_what_is_settled(self):
+    def test_the_model_sees_everything_the_other_sources_found(self):
         seen = {}
 
         def handler(request):
@@ -55,32 +54,37 @@ class TestRequest:
             releases=[release(), release(album="Live", recording="b")],
             audio=AudioFeatures(bpm=120, key="C major", genres=[("Techno", 0.5)]),
         )
-        resolve(findings, ["title", "release"], handler, info={"title": "t", "formats": [1], "uploader": "u"})
-        assert seen["ask"] == ["title", "release"]
+        resolve(findings, handler, info={"title": "t", "formats": [1], "uploader": "u"})
         assert seen["upload"] == {"title": "t", "uploader": "u"}
-        assert "title" not in seen["settled"] and seen["settled"]["artist"] == "Tidal Pools"
+        assert seen["heuristic_guess"]["title"] == "low tide (official)"
         assert [entry["album"] for entry in seen["musicbrainz"]] == ["Salt", "Live"]
         assert seen["audio_analysis"]["bpm"] == 120
 
 
 class TestAnswers:
-    def test_only_asked_fields_count(self):
-        verdict = resolve(Findings(upload=upload()), ["title"], lambda r: reply(title="Low Tide", artist="Someone Else"))
-        assert verdict.answers == {"title": "Low Tide"}
-        assert verdict.confidence == 0.8 and verdict.asked == ["title"]
+    def test_every_field_answered_counts(self):
+        answers = {"title": "Low Tide", "artist": "Tidal Pools", "year": 2021, "track_number": 3, "track_total": 10,
+                   "label": "Driftwood", "composer": ["Ana Reyes"], "genres": ["Ambient"]}
+        verdict = resolve(Findings(upload=upload()), lambda r: reply(**answers))
+        assert verdict.answers == answers
+        assert verdict.confidence == 0.8
 
-    def test_unusable_answers_are_dropped(self):
+    def test_unusable_answers_are_dropped_and_sloppy_ones_repaired(self):
         findings = Findings(upload=upload(), releases=[release(), release(album="B", recording="b")])
-        verdict = resolve(findings, ["year", "release", "album"], lambda r: reply(year="1998", release=5, album="  "))
-        assert verdict.answers == {"year": 1998}
+        sloppy = {"year": "1998", "release": 5, "album": "  ", "track_number": 0, "track_total": "12",
+                  "composer": ["", " "], "producer": "Odd Harbor", "lyricist": ["Ana", "ana", " Kim "],
+                  "genres": [f"g{index}" for index in range(8)]}
+        verdict = resolve(findings, lambda r: reply(**sloppy))
+        assert verdict.answers == {"year": 1998, "track_total": 12, "producer": ["Odd Harbor"], "lyricist": ["Ana", "Kim"],
+                                   "genres": ["g0", "g1", "g2", "g3", "g4"]}
 
     def test_a_valid_release_index_is_kept(self):
         findings = Findings(upload=upload(), releases=[release(), release(album="B", recording="b")])
-        assert resolve(findings, ["release"], lambda r: reply(release=1)).answers == {"release": 1}
+        assert resolve(findings, lambda r: reply(release=1)).answers == {"release": 1}
 
     def test_an_unreachable_or_garbled_model_raises_lookup_unavailable(self):
         with pytest.raises(LookupUnavailable):
-            resolve(Findings(upload=upload()), ["title"], lambda r: httpx.Response(500))
+            resolve(Findings(upload=upload()), lambda r: httpx.Response(500))
         garbled = httpx.Response(200, json={"choices": [{"message": {"content": "no json here"}}]})
         with pytest.raises(LookupUnavailable):
-            resolve(Findings(upload=upload()), ["title"], lambda r: garbled)
+            resolve(Findings(upload=upload()), lambda r: garbled)
