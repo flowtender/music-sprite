@@ -40,8 +40,10 @@ def add_to_library(config: LibraryConfig, entry: QueueEntry, meta: TrackMetadata
 
 def _archive_source_metadata(config: LibraryConfig, entry: QueueEntry) -> None:
     extractor = safe_name(entry.info.get("extractor_key") or "unknown")
-    name = safe_name(entry.info.get("id") or entry.audio_path.stem)
-    destination = config.archive_dir / extractor / f"{name}.info.json"
+    name = entry.info.get("id") or entry.audio_path.stem
+    if entry.info.get("section_number"):  # a chapter of a split upload, which shares the upload's id
+        name += f".{entry.info['section_number']:03d}"
+    destination = config.archive_dir / extractor / f"{safe_name(name)}.info.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(entry.info_path, destination)
 

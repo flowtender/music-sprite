@@ -6,7 +6,7 @@ Discord bot: `/<name> download <url>` pulls audio with yt-dlp, tags it from seve
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e '.[test]'   # the full `analysis` extra is ~300 MB and not needed for tests
-.venv/bin/python -m pytest -q                                      # baseline: 109 pass (the ffmpeg-dependent test skips without ffmpeg)
+.venv/bin/python -m pytest -q                                      # baseline: 113 pass (the ffmpeg-dependent test skips without ffmpeg)
 ```
 
 - No linter or formatter is configured. Match the surrounding style; don't reformat code you aren't changing.
@@ -16,7 +16,7 @@ python -m venv .venv && .venv/bin/pip install -e '.[test]'   # the full `analysi
 ## Pipeline
 
 ```
-bot.py  download command → pipeline.download (downloader.py, yt-dlp) → staging.adopt → QueueEntry on disk
+bot.py  download command → pipeline.download (downloader.py, yt-dlp; --split-chapters yields one track per chapter) → staging.adopt → QueueEntry on disk
         → pipeline.resolve_entry → resolver.resolve: the upload's own tags (heuristics.py) first, then side by side
              AcoustID fingerprint → MusicBrainz details (acoustid.py, musicbrainz.py) | Essentia (analysis.py)
            then llm.py asks about ONLY the fields those leave ambiguous
@@ -55,7 +55,7 @@ There is no MusicBrainz text search: without an AcoustID match (or without `ACOU
 
 `tests/conftest.py` has the builders `release()`, `upload()` (`TrackMetadata`), `resolution()` and `llm_config()`, and the fixtures `staging`, `make_entry`, `resolver` (a fake whose `resolve` each test sets), `make_pipeline` and `imported` (records library imports instead of tagging). Use them; tests build plain objects and don't mock discord.py beyond fake interactions and channels.
 
-Covered: analysis worker, staging, reconcile, resolver, llm, pipeline, config, emoji sync, the download batch in `bot.py`, review card and queue list (including a round-trip of every posted `custom_id`). **Not covered:** `tagger.py`, `library.py`, `layout.py`, `downloader.py`, `heuristics.py`, `musicbrainz.py`, `acoustid.py`. Before refactoring one of these, write characterization tests for it first.
+Covered: analysis worker, staging, reconcile, resolver, llm, pipeline, config, emoji sync, the download batch in `bot.py`, chapter splitting in `downloader.py`, review card and queue list (including a round-trip of every posted `custom_id`). **Not covered:** `tagger.py`, `library.py`, `layout.py`, the rest of `downloader.py`, `heuristics.py`, `musicbrainz.py`, `acoustid.py`. Before refactoring one of these, write characterization tests for it first.
 
 ## Conventions
 

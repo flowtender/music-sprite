@@ -258,7 +258,7 @@ class MusicBot(discord.Client):
                 log.warning("could not delete review message %s", message_id, exc_info=True)
 
 
-@app_commands.describe(url="Link to download", options="Optional yt-dlp options, e.g. --no-playlist --playlist-items 1-5")
+@app_commands.describe(url="Link to download", options="Optional yt-dlp options, e.g. --split-chapters (album in one video) --no-playlist")
 async def _download_callback(interaction: discord.Interaction, url: str, options: str = "") -> None:
     bot = interaction.client
     assert isinstance(bot, MusicBot)
